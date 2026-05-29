@@ -30,10 +30,33 @@ class KlineDB:
     def __init__(self):
         self._client = None
 
+    # 备用服务器列表（mootdx 配置失败时使用）
+    _FALLBACK_SERVERS = [
+        ("110.41.147.114", 7709),
+        ("124.70.176.52",  7709),
+        ("121.36.54.217",  7709),
+    ]
+
     @property
     def client(self):
         if self._client is None:
-            self._client = Quotes.factory(market="std")
+            # 先尝试从配置自动选服务器
+            try:
+                self._client = Quotes.factory(market="std")
+                # 简单测试连接是否可用
+                _ = self._client.server
+                if not _:
+                    raise ValueError("server empty")
+            except Exception:
+                # 配置失败，逐个尝试备用服务器
+                for ip, port in self._FALLBACK_SERVERS:
+                    try:
+                        self._client = Quotes.factory(
+                            market="std", ip=ip, port=port
+                        )
+                        break
+                    except Exception:
+                        continue
         return self._client
 
     def get(self, code: str, freq: str = "day", bars: int = 60) -> pd.DataFrame:
