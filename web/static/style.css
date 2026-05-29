@@ -1,0 +1,146 @@
+/* ── 全局 ───────────────────────────────────── */
+body {
+  background: #f4f6f8;
+  font-size: 14px;
+  color: #222;
+}
+
+/* ── 账户概览条 ─────────────────────────────── */
+.account-bar {
+  background: #1a1a2e;
+  color: #eee;
+  font-size: 13px;
+}
+.account-bar .label {
+  color: #888;
+  margin-right: 4px;
+  font-size: 12px;
+}
+.account-bar .value {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+/* ── 粘性 Tab ───────────────────────────────── */
+.sticky-tab {
+  position: sticky;
+  top: 56px;
+  z-index: 100;
+  background: #fff;
+  border-bottom: 1px solid #dee2e6;
+}
+.nav-tabs .nav-link {
+  font-size: 13px;
+  padding: 8px 4px;
+  color: #555;
+}
+.nav-tabs .nav-link.active {
+  font-weight: 600;
+  color: #0d6efd;
+}
+
+/* ── 卡片 ───────────────────────────────────── */
+.stock-card {
+  background: #fff;
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 10px;
+  box-shadow: 0 1px 4px rgba(0,0,0,.07);
+}
+.stock-card .code-name {
+  font-weight: 600;
+  font-size: 15px;
+}
+.stock-card .code-tag {
+  color: #888;
+  font-size: 12px;
+  margin-left: 6px;
+}
+.stock-card .price {
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.1;
+}
+.stock-card .meta {
+  font-size: 12px;
+  color: #666;
+  margin-top: 4px;
+}
+
+/* ── 涨跌色 ─────────────────────────────────── */
+.up   { color: #e53935; }  /* A股：红涨 */
+.down { color: #43a047; }  /* A股：绿跌 */
+.flat { color: #888; }
+
+/* ── 止损进度条 ─────────────────────────────── */
+.stop-bar-wrap {
+  margin-top: 8px;
+}
+.stop-bar-wrap .bar-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: #888;
+  margin-bottom: 2px;
+}
+.stop-bar-wrap .progress {
+  height: 5px;
+  border-radius: 3px;
+  background: #eee;
+}
+.stop-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width .3s;
+}
+
+/* ── 信号徽章 ───────────────────────────────── */
+.signal-badge {
+  display: inline-block;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 20px;
+  font-weight: 500;
+}
+.signal-金叉 { background: #e8f5e9; color: #2e7d32; }
+.signal-回踩 { background: #e3f2fd; color: #1565c0; }
+.signal-压缩 { background: #fff3e0; color: #e65100; }
+.signal-候选 { background: #f3e5f5; color: #6a1b9a; }
+
+/* ── 添加栏 ─────────────────────────────────── */
+.add-bar .form-control {
+  border-radius: 8px 0 0 8px;
+}
+.add-bar .btn {
+  border-radius: 0 8px 8px 0;
+}
+
+/* ── 空态 ───────────────────────────────────── */
+.empty-state {
+  text-align: center;
+  color: #aaa;
+  padding: 48px 0;
+  font-size: 14px;
+}
+
+/* ── 账户详情 ───────────────────────────────── */
+.account-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid #f0f0f0;
+  font-size: 14px;
+}
+.account-row:last-child { border-bottom: none; }
+.account-row .key { color: #666; }
+.account-row .val { font-weight: 600; }
+
+/* ── 刷新倒计时 ─────────────────────────────── */
+#refresh-time { font-size: 11px; }
+
+/* ── 手机优化 ───────────────────────────────── */
+@media (max-width: 576px) {
+  .tab-content { padding: 12px 8px !important; }
+  .stock-card  { padding: 12px; }
+  .stock-card .price { font-size: 18px; }
+}

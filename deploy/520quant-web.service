@@ -1,0 +1,20 @@
+[Unit]
+Description=520量化 Web 仪表板
+After=network.target
+
+[Service]
+User=__USER__
+WorkingDirectory=__APP_DIR__
+ExecStart=__VENV_DIR__/bin/python3 -m gunicorn \
+    --workers 2 \
+    --bind 0.0.0.0:5000 \
+    --timeout 60 \
+    --access-logfile - \
+    web.app:app
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

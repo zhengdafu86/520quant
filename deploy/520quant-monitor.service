@@ -1,0 +1,19 @@
+[Unit]
+Description=520量化 监控引擎
+After=network.target
+Wants=network-online.target
+
+[Service]
+User=__USER__
+WorkingDirectory=__APP_DIR__
+ExecStart=__VENV_DIR__/bin/python3 -u run.py
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+# 确保每天 15:30/15:35 定时任务正常执行
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

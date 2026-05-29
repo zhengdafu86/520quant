@@ -1,0 +1,6 @@
+mootdx>=0.9
+requests>=2.28
+pandas>=1.5
+flask>=3.0
+flask-cors>=4.0
+gunicorn>=21.0
