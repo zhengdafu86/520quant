@@ -34,10 +34,36 @@ def is_market_open(now: datetime = None) -> bool:
            (dtime(13, 0)  <= t <= dtime(15, 0))
 
 
+def is_buy_window(now: datetime = None) -> bool:
+    """
+    买入时间窗口：10:00-11:30 和 13:30-14:00
+    避开开盘30分钟（游资试盘）和尾盘（主力出货）
+    """
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return (dtime(10, 0) <= t <= dtime(11, 30)) or \
+           (dtime(13, 30) <= t <= dtime(14, 0))
+
+
+def is_profit_exit_window(now: datetime = None) -> bool:
+    """
+    止盈执行窗口：14:30-15:00
+    尾盘趋势已确认，此时止盈不易被洗盘
+    止损不受此限制，随时执行
+    """
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return dtime(14, 30) <= t <= dtime(15, 0)
+
+
 # ── 实时报价 ──────────────────────────────────────────
 
 def _prefix(code: str) -> str:
-    return "sh" if code.startswith(("6", "9")) else "sz"
+    return "sh" if code.startswith(("6", "9", "5")) else "sz"
 
 def get_quotes(codes: list[str]) -> dict[str, dict]:
     """

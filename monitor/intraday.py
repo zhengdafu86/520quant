@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from enum import Enum
 from datetime import datetime
 
-from monitor.realtime import get_quote, get_minute_bars
+from monitor.realtime import (get_quote, get_minute_bars,
+                              is_buy_window, is_profit_exit_window)
 
 
 class Action(Enum):
@@ -42,17 +43,35 @@ class IntradayEngine:
     # ── 候选股入场 ──────────────────────────────────
 
     def check_entry(self, code: str, daily_df: pd.DataFrame,
-                    quote: dict) -> IntradaySignal:
+                    quote: dict, signal_type: str = "") -> IntradaySignal:
         """
         日线已出买点信号 → 分钟级确认最优入场时机
+        signal_type: WatchItem.signal，用于区分金叉/回踩/粘合，调整入场条件
         策略：
-          1. 价格在MA20上方但不超过5%（不追高）
-          2. 最近3根1分钟K均在MA20上方（站稳）
-          3. 当日量能有起色（避免无量假突破）
+          1. 买入时间窗口：10:00-11:30 / 13:30-14:00
+          2. 价格在MA20上方但不超过5%（不追高）
+          3. 最近3根5分钟K均在MA20上方（站稳）
+          4. 当日量能有起色（避免无量假突破）
+          5. 非跌停板（跌停无法成交）
         """
         price = quote.get("price", 0)
         if not price:
             return IntradaySignal(Action.WAIT, 0, "报价异常")
+
+        # ── 时间窗口过滤 ──────────────────────────────
+        if not is_buy_window():
+            return IntradaySignal(
+                Action.WAIT, price,
+                "非买入窗口（10:00-11:30 或 13:30-14:00），等待"
+            )
+
+        # ── 跌停板检测（无法成交）─────────────────────
+        last_close = quote.get("last_close", 0)
+        if last_close > 0 and price <= last_close * 0.901:
+            return IntradaySignal(
+                Action.WAIT, price,
+                f"跌停板（前收{last_close:.2f}），无法买入"
+            )
 
         last  = daily_df.iloc[-1]
         ma20  = float(last["ma20"])
@@ -63,6 +82,15 @@ class IntradayEngine:
             return IntradaySignal(
                 Action.WAIT, price,
                 f"价格{price:.2f} < MA20={ma20:.2f}，不追"
+            )
+
+        # 死叉保护：金叉/粘合信号要求价格 ≥ MA5
+        # 回踩信号的合理区间是 MA20 ≤ price ≤ MA5，不做此限制
+        is_pullback = "回踩" in signal_type
+        if not is_pullback and price < ma5:
+            return IntradaySignal(
+                Action.WAIT, price,
+                f"价格{price:.2f} < MA5={ma5:.2f}，短线趋势转弱，有死叉风险，等待企稳"
             )
 
         # 不追高超5%
@@ -100,21 +128,31 @@ class IntradayEngine:
 
     def check_position(self, code: str, daily_df: pd.DataFrame,
                        quote: dict, cost: float,
-                       stop_price: float) -> IntradaySignal:
+                       stop_price: float,
+                       peak_pnl: float = 0.0) -> IntradaySignal:
         """
         持仓实时止损止盈（每30秒调用）
-        stop_price: 入场时设定的初始止损价（MA5附近）
+        stop_price: 入场时设定的初始止损价
+        peak_pnl:   持仓期间历史最高盈利%，用于回落保护
         """
         price = quote.get("price", 0)
         if not price:
             return IntradaySignal(Action.HOLD, 0, "报价异常")
 
-        last     = daily_df.iloc[-1]
-        ma5      = float(last["ma5"])
-        ma20     = float(last["ma20"])
-        pnl_pct  = (price - cost) / cost * 100
+        last    = daily_df.iloc[-1]
+        ma5     = float(last["ma5"])
+        ma20    = float(last["ma20"])
+        pnl_pct = (price - cost) / cost * 100
 
-        # ① 趋势止损：实时价格跌破MA20且持续（3根5分钟K收盘均在MA20下方）
+        # ① 硬止损：亏损 >= 5%（跌至成本价×0.95）
+        if pnl_pct <= -5.0:
+            return IntradaySignal(
+                Action.SELL_STOP, price,
+                f"亏损{pnl_pct:.1f}%，触发止损（成本×95%）",
+                urgency="urgent"
+            )
+
+        # ② 趋势止损：跌破MA20持续3根5分钟K
         if price < ma20:
             min_df = get_minute_bars(code, freq="5m", count=10)
             below  = 0
@@ -123,41 +161,65 @@ class IntradayEngine:
             if below >= 2:
                 return IntradaySignal(
                     Action.SELL_STOP, price,
-                    f"跌破MA20={ma20:.2f} 持续{below}根5分钟K | 亏损{pnl_pct:.1f}%",
+                    f"跌破MA20={ma20:.2f} 持续{below}根5分钟K | 盈亏{pnl_pct:.1f}%",
                     urgency="urgent"
                 )
 
-        # ② 止损价触发（买入时设定的MA5保护线）
+        # ③ 止损价触发
         if price < stop_price:
             return IntradaySignal(
                 Action.SELL_STOP, price,
-                f"触及止损价{stop_price:.2f} | 亏损{pnl_pct:.1f}%",
+                f"触及止损价{stop_price:.2f} | 盈亏{pnl_pct:.1f}%",
                 urgency="urgent"
             )
 
-        # ③ 常规止盈：盈利3-5%
-        if 3.0 <= pnl_pct <= 5.5:
+        # ── 止盈类信号：14:30 前先观察，14:30 后才执行 ──────────
+        _in_exit_win = is_profit_exit_window()
+
+        # ④ 日线死叉（MA5 下穿 MA20）：趋势结束，且当前仍盈利 → 主动止盈
+        # 这是金叉入场的对称出场信号；亏损持仓不触发（止损逻辑已覆盖）
+        if ma5 < ma20 and pnl_pct > 0:
+            if _in_exit_win:
+                return IntradaySignal(
+                    Action.SELL_PROFIT, price,
+                    f"日线死叉 MA5={ma5:.2f}<MA20={ma20:.2f}，趋势结束 | 盈亏{pnl_pct:+.1f}%",
+                    urgency="urgent"
+                )
             return IntradaySignal(
-                Action.SELL_PROFIT, price,
-                f"盈利{pnl_pct:.1f}%，常规止盈区间",
+                Action.HOLD, price,
+                f"⏳死叉待执行(14:30后) | MA5={ma5:.2f}<MA20={ma20:.2f} | 盈亏{pnl_pct:+.1f}%"
             )
 
-        # ④ 强势止盈保护：涨幅>7% 后日内回落2%以上，锁定利润
-        if pnl_pct > 7:
-            min_df = get_minute_bars(code, freq="5m", count=20)
-            if min_df is not None and not min_df.empty:
-                intraday_high = min_df["high"].max()
-                pullback = (intraday_high - price) / intraday_high * 100
-                if pullback >= 2.0:
-                    return IntradaySignal(
-                        Action.SELL_PROFIT, price,
-                        f"高位回落{pullback:.1f}% | 盈利{pnl_pct:.1f}%，保护性止盈",
-                        urgency="urgent"
-                    )
+        # ⑤ 浮盈回落保护：峰值≥5%，回落≥5pp，且当前仍盈利
+        if peak_pnl >= 5.0 and (peak_pnl - pnl_pct) >= 5.0 and pnl_pct > 0:
+            if _in_exit_win:
+                return IntradaySignal(
+                    Action.SELL_PROFIT, price,
+                    f"利润从峰值{peak_pnl:.1f}%回落{peak_pnl-pnl_pct:.1f}pp"
+                    f"至{pnl_pct:.1f}%，保护性止盈",
+                    urgency="urgent"
+                )
+            return IntradaySignal(
+                Action.HOLD, price,
+                f"⏳止盈待确认(14:30后执行) | 峰值{peak_pnl:.1f}%→当前{pnl_pct:.1f}%"
+            )
+
+        # ⑥ 回落保护止盈：峰值曾超过10%，现回落至10%
+        if peak_pnl >= 10.0 and pnl_pct <= 10.0:
+            if _in_exit_win:
+                return IntradaySignal(
+                    Action.SELL_PROFIT, price,
+                    f"利润从峰值{peak_pnl:.1f}%回落至{pnl_pct:.1f}%，锁定利润",
+                    urgency="urgent"
+                )
+            return IntradaySignal(
+                Action.HOLD, price,
+                f"⏳止盈待确认(14:30后执行) | 峰值{peak_pnl:.1f}%→当前{pnl_pct:.1f}%"
+            )
 
         return IntradaySignal(
             Action.HOLD, price,
-            f"持仓正常 | 盈亏={pnl_pct:.1f}% | "
+            f"持仓正常 | 盈亏={pnl_pct:.1f}% | 峰值={peak_pnl:.1f}% | "
             f"MA5={ma5:.2f} MA20={ma20:.2f}"
         )
 

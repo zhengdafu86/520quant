@@ -16,6 +16,13 @@ import pandas as pd
 
 from data.fetcher import db
 from strategy.signal_520 import strategy, Signal
+
+# 各信号对应建仓比例（相对单只股票槽位 = 总资金 / max_positions）
+SIGNAL_SIZE = {
+    Signal.BUY_GOLDEN_CROSS: 0.30,   # 金叉：3成
+    Signal.BUY_PULLBACK:     0.20,   # 回踩：加2成
+    Signal.BUY_SQUEEZE:      0.50,   # 粘合：5成
+}
 from monitor.realtime import get_quotes, is_trading_time, is_market_open
 from monitor.intraday import engine as intraday_engine, Action
 from alert.notifier import (log, notify_buy, notify_sell, notify_warning,
@@ -33,8 +40,9 @@ class Position:
     cost:        float
     shares:      int
     stop_price:  float
-    entry_time:  str  = ""
-    hold_days:   int  = 0
+    entry_time:  str   = ""
+    hold_days:   int   = 0
+    peak_pnl:    float = 0.0   # 历史最高盈利%，用于回落保护止盈
 
     @property
     def market_value(self) -> float:
@@ -47,6 +55,9 @@ class Position:
         return (price - self.cost) / self.cost * 100
 
 
+_PRIORITY_KEY = {"P1": 1, "P2": 2, "P3": 3}   # 数字越小越优先
+
+
 @dataclass
 class WatchItem:
     """候选股（日线已触发买点，等日内确认）"""
@@ -54,6 +65,7 @@ class WatchItem:
     name:       str
     signal:     str
     daily_df:   pd.DataFrame
+    priority:   str = ""    # "P1" / "P2" / "P3"；空字符串 = 扫描器自动加入，排最后
     added_time: str = ""
 
     def __post_init__(self):
@@ -66,14 +78,17 @@ class WatchItem:
 class MonitorEngine:
 
     def __init__(self, interval: int = 30, paper_mode: bool = True):
-        self.interval    = interval      # 轮询间隔（秒）
-        self.paper_mode  = paper_mode    # True=模拟交易 / False=实盘（需接券商）
+        self.interval       = interval      # 轮询间隔（秒）
+        self.paper_mode     = paper_mode    # True=模拟交易 / False=实盘（需接券商）
+        self.max_positions  = 4             # 最多同时持仓4只
+        self.init_capital   = 200_000.0     # 总资金，用于计算每仓金额
         self.positions:  dict[str, Position]  = {}
         self.watchlist:  dict[str, WatchItem] = {}
         self._running    = False
         self._lock       = threading.Lock()
         self._broker     = None          # 可注入券商接口
         self._paper      = PaperAccount() if paper_mode else None
+        self._warn_cooldown: dict[str, float] = {}   # code -> 上次预警时间戳
 
     # ── 持仓管理 ──────────────────────────────────
 
@@ -97,18 +112,45 @@ class MonitorEngine:
         with self._lock:
             self.positions.pop(code, None)
 
-    def add_watch(self, code: str, name: str, signal: str):
-        """加入候选股监控"""
+    def add_watch(self, code: str, name: str, signal: str, priority: str = ""):
+        """加入候选股监控
+        priority: "P1" / "P2" / "P3"（手动 WATCHLIST 设置）；
+                  空字符串 = 扫描器自动发现，排在所有手动股票之后
+        """
         daily_df = db.get(code)
         with self._lock:
             self.watchlist[code] = WatchItem(
-                code=code, name=name, signal=signal, daily_df=daily_df
+                code=code, name=name, signal=signal,
+                daily_df=daily_df, priority=priority
             )
-        log(f"候选股加入: {name}({code}) 信号={signal}", "INFO")
+        tag = priority if priority else "自动"
+        log(f"候选股加入: {name}({code}) 信号={signal} [{tag}]", "INFO")
 
     def remove_watch(self, code: str):
         with self._lock:
             self.watchlist.pop(code, None)
+
+    def load_from_paper(self):
+        """从 paper 账户同步持仓（服务启动时调用，替代硬编码 POSITIONS）"""
+        if not (self.paper_mode and self._paper):
+            return
+        paper_pos = self._paper.positions()
+        if not paper_pos:
+            log("paper 账户当前无持仓，以空仓启动", "INFO")
+            return
+        for code, p in paper_pos.items():
+            with self._lock:
+                self.positions[code] = Position(
+                    code=code,
+                    name=p.name,
+                    cost=p.cost,
+                    shares=p.shares,
+                    stop_price=p.stop_price,
+                    entry_time=getattr(p, "entry_time", ""),
+                )
+            log(f"加载持仓: {p.name}({code}) 成本={p.cost} "
+                f"止损={p.stop_price} {p.shares}股", "INFO")
+        log(f"共加载 {len(paper_pos)} 只持仓", "INFO")
 
     # ── 核心轮询 ──────────────────────────────────
 
@@ -118,7 +160,8 @@ class MonitorEngine:
             pos_codes   = list(self.positions.keys())
             watch_codes = list(self.watchlist.keys())
 
-        all_codes = list(set(pos_codes + watch_codes))
+        # 510300（沪深300 ETF）随报价一并拉取，用于日内大盘监控
+        all_codes = list(set(pos_codes + watch_codes + ["510300"]))
         if not all_codes:
             return
 
@@ -126,6 +169,13 @@ class MonitorEngine:
         if not quotes:
             log("报价获取失败，跳过本轮", "WARN")
             return
+
+        # 大盘日内急跌保护：跌幅 > 2% 时只平仓不建仓
+        mkt_q = quotes.get("510300", {})
+        mkt_chg = mkt_q.get("change_pct", 0) or 0
+        market_hard_down = mkt_chg < -2.0
+        if market_hard_down:
+            log(f"⚠️ 大盘日内跌{mkt_chg:.1f}%，只平仓不建仓", "WARN")
 
         ts = datetime.now().strftime("%H:%M:%S")
 
@@ -137,57 +187,110 @@ class MonitorEngine:
                 continue
 
             price = quote["price"]
+
+            # 跌停板检测：无法成交，跳过本轮（止损指令也无法执行）
+            last_close = quote.get("last_close", 0)
+            if last_close > 0 and price <= last_close * 0.901:
+                log(f"⚠️ {pos.name}({code}) 跌停板，止损指令跳过，等待明日", "WARN")
+                continue
             with self._lock:
                 daily_df = db.get(code)
 
+            # 更新历史最高盈利（用于回落保护止盈）
+            pnl_pct = pos.pnl_pct(price)
+            with self._lock:
+                if code in self.positions:
+                    self.positions[code].peak_pnl = max(
+                        self.positions[code].peak_pnl, pnl_pct
+                    )
+                    pos = self.positions[code]   # 取最新引用
+
             sig = intraday_engine.check_position(
                 code, daily_df, quote,
-                cost=pos.cost, stop_price=pos.stop_price
+                cost=pos.cost, stop_price=pos.stop_price,
+                peak_pnl=pos.peak_pnl,
             )
 
             if sig.action in (Action.SELL_STOP, Action.SELL_PROFIT):
-                notify_sell(
-                    code, pos.name, price,
-                    pos.shares, pos.cost, sig.reason
-                )
-                self._do_sell(pos, price, sig.reason)
+                self._do_sell(pos, price, sig.reason)  # notify_sell 移至内部，仅成功才推送
             else:
                 pnl = pos.pnl_pct(price)
-                # 接近止损线预警（距止损价 < 2%）
                 if pos.stop_price and price > 0:
                     gap_pct = (price - pos.stop_price) / price * 100
-                    if 0 < gap_pct < 2.0:
-                        notify_warning(
-                            code, pos.name, price, pos.cost,
-                            f"距止损线仅剩 {gap_pct:.1f}%（止损={pos.stop_price:.2f}）"
-                        )
                 log(f"{pos.name}({code}) {price:.2f} | "
-                    f"盈亏={pnl:+.1f}% | {sig.reason}")
+                    f"盈亏={pnl:+.1f}% | 峰值={pos.peak_pnl:.1f}% | {sig.reason}")
 
         # ── 追踪止损更新（持仓检查后执行，确保未被卖出的仓位才更新）──
         self._update_trailing_stops(quotes)
 
-        # ── 候选股检查 ──
-        for code in watch_codes:
+        # ── 候选股检查（先做大盘过滤）──
+        # 大盘 MA20 > MA60 才允许新建仓（与回测逻辑保持一致）
+        # 与个股520战法同逻辑：要求指数自身也处于金叉（短期均线在中期均线上方）
+        market_up = True
+        try:
+            market_df = db.get_market(bars=80)   # MA60 需要至少 60 根
+            if not market_df.empty and len(market_df) >= 60:
+                import pandas as _pd
+                last_mrow  = market_df.iloc[-1]
+                m_close    = float(last_mrow["close"])
+                m_ma60     = last_mrow.get("ma60", float("nan"))
+                m_ma20 = last_mrow.get("ma20", float("nan"))
+                if (not _pd.isna(m_ma20) and not _pd.isna(m_ma60)
+                        and float(m_ma60) > 0):
+                    # 大盘金叉：MA20 > MA60（与个股520战法同逻辑）
+                    market_up = float(m_ma20) > float(m_ma60)
+                    if not market_up:
+                        log(f"⚠️ 大盘MA20({float(m_ma20):.3f}) < MA60({float(m_ma60):.3f})，"
+                            f"指数死叉，今日暂停新建仓", "INFO")
+                else:
+                    # MA60 数据不足时降级用 MA20 方向
+                    market_up = strategy.ma20_direction(market_df) == "up"
+                    if not market_up:
+                        log("⚠️ 大盘MA20未向上（MA60数据不足），今日暂停新建仓", "INFO")
+        except Exception as _e:
+            log(f"大盘数据获取失败，默认允许建仓: {_e}", "WARN")
+
+        # P1 → P2 → P3 → 自动扫描（无优先级）
+        watch_codes_sorted = sorted(
+            watch_codes,
+            key=lambda c: _PRIORITY_KEY.get(
+                self.watchlist[c].priority if c in self.watchlist else "", 99
+            )
+        )
+
+        if watch_codes_sorted:
+            log(f"候选股检查: 共{len(watch_codes_sorted)}只 | "
+                f"market_up={market_up} | hard_down={market_hard_down} | "
+                f"持仓{len(self.positions)}/{self.max_positions}", "INFO")
+
+        for code in watch_codes_sorted:
             quote = quotes.get(code)
             item  = self.watchlist.get(code)
             if not quote or not item:
+                log(f"候选 {code} 报价缺失，跳过", "WARN")
                 continue
 
             # 只在正式开盘后检查入场
             if not is_market_open():
                 continue
 
-            sig = intraday_engine.check_entry(code, item.daily_df, quote)
+            # 大盘趋势或日内急跌 → 跳过入场
+            if not market_up:
+                log(f"候选 {item.name}({code}) ⛔ 大盘MA60过滤，暂不入场")
+                continue
+            if market_hard_down:
+                log(f"候选 {item.name}({code}) ⛔ 大盘急跌{mkt_chg:.1f}%，暂不入场")
+                continue
+
+            sig = intraday_engine.check_entry(code, item.daily_df, quote,
+                                              signal_type=item.signal)
 
             if sig.action == Action.BUY:
+                if len(self.positions) >= self.max_positions:
+                    log(f"候选 {item.name}({code}) ⛔ 已达最大持仓{self.max_positions}只，跳过")
+                    continue
                 price  = quote["price"]
                 shares = self._calc_shares(price)
-                notify_buy(
-                    code, item.name, price, shares,
-                    sig.reason,
-                    stop_price=round(price * 0.95, 2)
-                )
                 self._do_buy(code, item.name, price, shares, sig.reason)
             else:
                 log(f"候选 {item.name}({code}) {quote['price']:.2f} | {sig.reason}")
@@ -215,7 +318,6 @@ class MonitorEngine:
                 log(f"下单失败: {e}", "ERR")
                 return
 
-        # 更新内部持仓（模拟或实盘均更新）
         self.add_position(
             code=code, cost=price, shares=shares, name=name,
             stop_price=stop_price
@@ -232,7 +334,7 @@ class MonitorEngine:
                 log(f"[模拟] {msg}", "SELL")
             else:
                 log(f"[模拟] 卖出失败: {msg}", "WARN")
-                return
+                return   # 执行失败 → 不推通知，不移除持仓
         elif self._broker:
             try:
                 result = self._broker.sell(pos.code, price, pos.shares)
@@ -240,17 +342,14 @@ class MonitorEngine:
             except Exception as e:
                 log(f"卖出下单失败: {e}", "ERR")
                 return
+        # 执行成功后才推企微通知并从内存移除
+        notify_sell(pos.code, pos.name, price, pos.shares, pos.cost, reason)
         self.remove_position(pos.code)
 
-    def _calc_shares(self, price: float,
-                     total_capital: float = 100_000,
-                     risk_pct: float = 0.02,
-                     stop_pct: float = 0.05,
-                     max_position_pct: float = 0.30) -> int:
-        """仓位计算：每笔最大亏损=总资金×2%，止损5%→单笔≤总资金30%"""
-        max_loss  = total_capital * risk_pct
-        pos_val   = min(max_loss / stop_pct, total_capital * max_position_pct)
-        shares    = int(pos_val / price / 100) * 100
+    def _calc_shares(self, price: float) -> int:
+        """满仓计算：总资金 ÷ 最大持仓数 = 单仓资金"""
+        slot_cap = self.init_capital / self.max_positions
+        shares   = int(slot_cap / price / 100) * 100
         return max(100, shares)
 
     # ── 追踪止损 ──────────────────────────────────────
@@ -326,13 +425,6 @@ class MonitorEngine:
                 f"{old_stop:.2f} → {candidate_stop:.2f} "
                 f"（浮盈{gain_pct:+.1f}%）", "INFO")
 
-            # 只在跨越关键档位时才推送微信通知（避免刷屏）
-            if crossed_milestone:
-                notify_stop_raised(
-                    code, pos.name, price,
-                    old_stop, candidate_stop,
-                    gain_pct, milestone_label
-                )
 
     @staticmethod
     def _crossed_key_level(old_stop: float, new_stop: float, cost: float) -> bool:
@@ -393,25 +485,54 @@ class MonitorEngine:
 
         notify_daily_summary(pos_list, sig_list, account)
 
+    def _refresh_watchlist_daily_df(self):
+        """
+        每日开盘前刷新候选股的日线数据（daily_df）。
+        WatchItem.daily_df 在 add_watch() 时只抓取一次，
+        跨天运行时会过期导致 MA20 偏差。
+        """
+        with self._lock:
+            codes = list(self.watchlist.keys())
+        for code in codes:
+            try:
+                fresh_df = db.get(code, freq="day", bars=65)
+                with self._lock:
+                    if code in self.watchlist and not fresh_df.empty:
+                        self.watchlist[code].daily_df = fresh_df
+                log(f"刷新日线数据: {code}", "INFO")
+            except Exception as e:
+                log(f"刷新日线失败 {code}: {e}", "WARN")
+
     def _loop(self):
         log("监控引擎启动 ✅")
-        _summary_sent = False
-        _scan_sent    = False
+        _summary_sent  = False
+        _scan_sent     = False
+        _df_refreshed  = False   # 每日开盘前刷新一次日线数据
         while self._running:
             now = datetime.now()
+
+            # 09:15 刷新候选股日线数据（集合竞价前，每天一次）
+            if now.hour == 9 and now.minute >= 15 and not _df_refreshed:
+                self._refresh_watchlist_daily_df()
+                _df_refreshed = True
+
             # 15:30 收盘汇总
             if now.hour == 15 and now.minute == 30 and not _summary_sent:
                 self.send_daily_summary()
                 _summary_sent = True
+
             # 15:35 市场扫描（后台线程，不阻塞主循环）
             if now.hour == 15 and now.minute == 35 and not _scan_sent:
                 import threading
                 from scanner.market_scan import scanner
                 threading.Thread(target=scanner.run, daemon=True).start()
                 _scan_sent = True
+
+            # 次日重置所有每日标志
             if now.hour == 9 and now.minute < 15:
-                _summary_sent = False   # 次日重置
+                _summary_sent = False
                 _scan_sent    = False
+                _df_refreshed = False
 
             if is_trading_time():
                 try:
@@ -455,9 +576,15 @@ class MonitorEngine:
                   f"止损={pos.stop_price}  {pos.shares}股")
 
         print(f"\n【候选】共 {len(self.watchlist)} 只")
-        for code, item in self.watchlist.items():
-            price = quotes.get(code, {}).get("price", 0)
-            print(f"  ⭕ {item.name}({code})  现价={price:.2f}  "
+        # 按优先级排序展示
+        sorted_watch = sorted(
+            self.watchlist.items(),
+            key=lambda kv: _PRIORITY_KEY.get(kv[1].priority, 99)
+        )
+        for code, item in sorted_watch:
+            price    = quotes.get(code, {}).get("price", 0)
+            pri_tag  = f"[{item.priority}] " if item.priority else "[自动] "
+            print(f"  ⭕ {pri_tag}{item.name}({code})  现价={price:.2f}  "
                   f"信号={item.signal}  加入={item.added_time}")
 
         print("=" * 60 + "\n")

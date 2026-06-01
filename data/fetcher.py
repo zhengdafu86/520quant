@@ -4,14 +4,15 @@
 """
 from __future__ import annotations
 
+import threading
 import pandas as pd
 from pathlib import Path
 from mootdx.quotes import Quotes
 
 
 def _market(code: str) -> int:
-    """深圳=0，上海=1"""
-    return 1 if code.startswith(("6", "9")) else 0
+    """深圳=0，上海=1（5开头的ETF如510300归上海）"""
+    return 1 if code.startswith(("6", "9", "5")) else 0
 
 
 class KlineDB:
@@ -29,6 +30,7 @@ class KlineDB:
 
     def __init__(self):
         self._client = None
+        self._lock   = threading.Lock()   # mootdx TCP 连接非线程安全，必须序列化
 
     # 备用服务器列表（直接连接，不依赖 mootdx 配置文件）
     _SERVERS = [
@@ -58,12 +60,13 @@ class KlineDB:
         bars: 拉取根数
         """
         category = self.CATEGORY_MAP.get(freq, 4)
-        raw = self.client.bars(
-            symbol=code,
-            market=_market(code),
-            category=category,
-            offset=bars,
-        )
+        with self._lock:   # 序列化 mootdx 调用，防止多线程竞争
+            raw = self.client.bars(
+                symbol=code,
+                market=_market(code),
+                category=category,
+                offset=bars,
+            )
         if raw is None or raw.empty:
             return pd.DataFrame()
 
@@ -73,9 +76,10 @@ class KlineDB:
         return df
 
     def _add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """计算 MA5 / MA20 / 斜率 / 量比 / 金叉死叉"""
+        """计算 MA5 / MA20 / MA60 / 斜率 / 量比 / 金叉死叉 / ATR14 / 成交额"""
         df["ma5"]  = df["close"].rolling(5).mean().round(3)
         df["ma20"] = df["close"].rolling(20).mean().round(3)
+        df["ma60"] = df["close"].rolling(60).mean().round(3)   # 大盘趋势过滤用
 
         # 20日线斜率（3日差值）
         df["ma20_slope"] = df["ma20"].diff(3).round(4)
@@ -96,12 +100,63 @@ class KlineDB:
             elif prev["ma5"] >= prev["ma20"] and curr["ma5"] < curr["ma20"]:
                 df.at[i, "cross"] = -1
 
+        # ATR14：动态止损用
+        df["tr"] = pd.concat([
+            df["high"] - df["low"],
+            (df["high"] - df["close"].shift(1)).abs(),
+            (df["low"]  - df["close"].shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        df["atr14"] = df["tr"].rolling(14).mean().round(3)
+
+        # 日成交额（万元）和5日均值：流动性过滤用
+        df["turnover"]     = (df["close"] * df["vol"] * 100 / 10_000).round(0)   # 万元
+        df["avg_turnover"] = df["turnover"].rolling(5).mean().round(0)            # 5日均（万元）
+
         return df
 
     def latest(self, code: str, freq: str = "day") -> pd.Series:
         """返回最新一根K线 + 指标"""
         df = self.get(code, freq=freq, bars=60)
         return df.iloc[-1] if not df.empty else pd.Series()
+
+    def get_market(self, freq: str = "day", bars: int = 60) -> pd.DataFrame:
+        """获取沪深300 ETF（510300）作为大盘代理，用于趋势过滤"""
+        return self.get("510300", freq=freq, bars=bars)
+
+    def get_ma20_direction(self, code: str, bars: int = 60) -> str:
+        """
+        计算某代码的 MA20 方向，主要用于行业 ETF 趋势判断。
+        返回: 'up' | 'down' | 'flat' | 'unknown'
+        阈值与主策略 ma20_direction() 保持一致（0.1% 百分比斜率）。
+        """
+        df = self.get(code, freq="day", bars=bars)
+        if df.empty or len(df) < 3:
+            return "unknown"
+        last     = df.iloc[-1]
+        ma20_val = float(last.get("ma20")       or 0)
+        slope    = float(last.get("ma20_slope") or 0)
+        if ma20_val <= 0:
+            return "unknown"
+        threshold = ma20_val * 0.001    # 0.1%，与信号策略一致
+        if slope > threshold:
+            return "up"
+        if slope < -threshold:
+            return "down"
+        return "flat"
+
+    def get_20d_return(self, code: str) -> float:
+        """
+        计算代码的 20 个交易日价格涨幅（%），用于相对强度（RS）基准计算。
+        数据不足时返回 0.0。
+        """
+        df = self.get(code, freq="day", bars=30)
+        if df.empty or len(df) < 21:
+            return 0.0
+        c_now = float(df.iloc[-1]["close"])
+        c_20d = float(df.iloc[-21]["close"])
+        if c_20d <= 0:
+            return 0.0
+        return round((c_now - c_20d) / c_20d * 100, 2)
 
 
 # 全局单例

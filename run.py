@@ -5,6 +5,7 @@
   python run.py --test 002156       # 测试单只股票分析
   python run.py --status            # 查看当前状态 + 模拟账户余额
   python run.py --report            # 打印模拟账户绩效报告
+  python run.py --backtest          # 回测自选股（近1年，最多5仓）
   python run.py --paper-buy 002156 10.50 100   # 手动模拟买入
   python run.py --paper-sell 002156 11.20      # 手动模拟卖出
   python run.py --reset-paper                  # 重置模拟账户（清空数据）
@@ -17,34 +18,63 @@ import time
 # ── 模式开关 ────────────────────────────────────────────────
 PAPER_MODE = True        # True=模拟交易  False=实盘（需接券商API）
 
-# ── 当前持仓配置（每次启动前更新） ─────────────────────────
-POSITIONS = [
-    {"code": "002156", "name": "通富微电", "cost": 70.8,  "shares": 600},
-    {"code": "002625", "name": "光启技术", "cost": 39.4,  "shares": 1300},
-    {"code": "000426", "name": "兴业银锡", "cost": 39.9,  "shares": 1000},
-    # 特变电工 2026-05-28 止损出局 25.91，亏损 -2990 元(-10.3%)
-]
+# ── 持仓从 paper 账户自动读取，无需在此硬编码 ─────────────────
+# 使用 run.py --paper-buy <code> <price> <shares> 手动买入后会自动同步
+POSITIONS = []   # 保留字段以备手动临时注入，正常运行请留空
 
 # ── 日线候选股（收盘后扫描填入） ─────────────────────────────
 WATCHLIST = [
-    {"code": "603002", "name": "宏昌电子", "signal": "候选观察"},
-    {"code": "600487", "name": "亨通光电", "signal": "候选观察"},
+    {"code": "603002", "name": "宏昌电子", "signal": "候选观察", "priority": "P1"},
+    {"code": "600487", "name": "亨通光电", "signal": "候选观察", "priority": "P2"},
+    # priority: "P1"=最优先 / "P2"=次优先 / "P3"=普通
+    # 仓位有限时，P1先占坑，P2次之，P3再次，自动扫描的股票排最后
 ]
 
 
 def _build_monitor():
-    """构建并注入持仓的监控引擎"""
+    """构建监控引擎，持仓从 paper 账户同步"""
     from monitor.engine import MonitorEngine
+    from trader.paper import PaperAccount
+
     monitor = MonitorEngine(interval=30, paper_mode=PAPER_MODE)
-    for p in POSITIONS:
+    monitor.load_from_paper()
+
+    for p in POSITIONS:   # 通常为空，手动指定时才生效
         monitor.add_position(
             code=p["code"], name=p["name"],
             cost=p["cost"], shares=p["shares"]
         )
+
+    paper        = PaperAccount()
+    db_watchlist = paper.get_watchlist()   # 网页自选股（含优先级）
+    db_pri_map   = {w["code"]: w.get("priority", "") for w in db_watchlist}
+
+    # ① 先加载 run.py 里硬编码的 WATCHLIST（优先级以此为准）
+    loaded_codes: set[str] = set()
     for w in WATCHLIST:
+        priority = w.get("priority") or db_pri_map.get(w["code"], "")
         monitor.add_watch(
-            code=w["code"], name=w["name"], signal=w["signal"]
+            code=w["code"], name=w["name"], signal=w["signal"],
+            priority=priority
         )
+        loaded_codes.add(w["code"])
+
+    # ② 加载网页 DB 自选股（尚未在 ① 里的 + 尚未持仓的）
+    # 这是自动买入的主要来源：用户在页面扫描后点「+ 自选」的股票
+    for w in db_watchlist:
+        code = w["code"]
+        if code in loaded_codes:
+            continue                           # 已在 ① 里
+        if code in monitor.positions:
+            continue                           # 已在持仓，不重复加
+        monitor.add_watch(
+            code=code,
+            name=w["name"],
+            signal=w.get("signal", "候选"),
+            priority=w.get("priority", ""),
+        )
+        loaded_codes.add(code)
+
     return monitor
 
 
@@ -166,6 +196,44 @@ def run_paper_sell(code: str, price: float):
         paper.print_performance()
 
 
+def run_backtest(start_date: str = "", end_date: str = ""):
+    """
+    回测自选股
+    start_date: "2025-06-01"（不传则默认近250个交易日）
+    end_date:   "2026-05-29"（不传则到最新数据）
+    """
+    from trader.paper import PaperAccount
+    from backtest.engine import Backtester
+
+    # 股票池：paper DB 自选 + run.py WATCHLIST 合并去重
+    paper    = PaperAccount()
+    db_watch = paper.get_watchlist()
+    extra    = [{"code": w["code"], "name": w["name"]} for w in WATCHLIST]
+    seen     = set()
+    stocks   = []
+    for s in db_watch + extra:
+        if s["code"] not in seen:
+            seen.add(s["code"])
+            stocks.append({"code": s["code"], "name": s["name"]})
+
+    if not stocks:
+        print("自选股为空，请先添加股票再回测")
+        return
+
+    # 优先级映射：DB 自选股优先级（网页设置）+ run.py WATCHLIST（后者覆盖前者）
+    priority_map: dict[str, str] = {}
+    for w in db_watch:
+        if w.get("priority"):
+            priority_map[w["code"]] = w["priority"]
+    for w in WATCHLIST:
+        if w.get("priority"):
+            priority_map[w["code"]] = w["priority"]
+
+    bt = Backtester(init_capital=200_000, max_positions=4)
+    bt.run(stocks, bars=250, start_date=start_date, end_date=end_date,
+           priority_map=priority_map)
+
+
 def run_reset_paper():
     """重置模拟账户（危险操作，需二次确认）"""
     from pathlib import Path
@@ -194,6 +262,12 @@ if __name__ == "__main__":
 
     elif "--report" in args:
         run_report()
+
+    elif "--backtest" in args:
+        idx        = args.index("--backtest")
+        start_date = args[idx + 1] if idx + 1 < len(args) and not args[idx + 1].startswith("--") else ""
+        end_date   = args[idx + 2] if idx + 2 < len(args) and not args[idx + 2].startswith("--") else ""
+        run_backtest(start_date=start_date, end_date=end_date)
 
     elif "--paper-buy" in args:
         idx = args.index("--paper-buy")

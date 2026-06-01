@@ -86,7 +86,8 @@ def _init_db(conn: sqlite3.Connection):
             code       TEXT PRIMARY KEY,
             name       TEXT,
             signal     TEXT,
-            added_time TEXT
+            added_time TEXT,
+            priority   TEXT DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS scan_results (
@@ -102,6 +103,33 @@ def _init_db(conn: sqlite3.Connection):
         );
     """)
     conn.commit()
+    # 迁移：老数据库可能没有 priority 列
+    try:
+        conn.execute("ALTER TABLE watchlist ADD COLUMN priority TEXT DEFAULT ''")
+        conn.commit()
+    except Exception:
+        pass   # 列已存在，忽略
+
+    # 迁移：scan_results 加 rs_score 列（相对强度分）
+    try:
+        conn.execute("ALTER TABLE scan_results ADD COLUMN rs_score REAL DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass   # 列已存在，忽略
+
+    # 迁移：scan_results 加 sector_dir 列（板块ETF方向，仅展示）
+    try:
+        conn.execute("ALTER TABLE scan_results ADD COLUMN sector_dir TEXT DEFAULT ''")
+        conn.commit()
+    except Exception:
+        pass   # 列已存在，忽略
+
+    # 迁移：scan_results 加 cross_date 列（金叉形成日期）
+    try:
+        conn.execute("ALTER TABLE scan_results ADD COLUMN cross_date TEXT DEFAULT ''")
+        conn.commit()
+    except Exception:
+        pass   # 列已存在，忽略
 
     # 初始化账户资金（首次）
     cur = conn.execute("SELECT value FROM account WHERE key='cash'")
@@ -119,7 +147,7 @@ def _init_db(conn: sqlite3.Connection):
 
 # ── 模拟账户 ──────────────────────────────────────────────
 
-INIT_CAPITAL = 100_000.0    # 初始资金（可在启动时修改）
+INIT_CAPITAL = 200_000.0    # 初始资金（可在启动时修改）
 
 
 class PaperAccount:
@@ -440,21 +468,43 @@ class PaperAccount:
 
     def get_watchlist(self) -> list[dict]:
         rows = self._conn.execute(
-            "SELECT code,name,signal,added_time FROM watchlist ORDER BY added_time DESC"
+            "SELECT code,name,signal,added_time,priority FROM watchlist "
+            "ORDER BY added_time DESC"
         ).fetchall()
-        return [{"code": r[0], "name": r[1], "signal": r[2], "added_time": r[3]}
-                for r in rows]
+        return [
+            {"code": r[0], "name": r[1], "signal": r[2],
+             "added_time": r[3], "priority": r[4] or ""}
+            for r in rows
+        ]
 
-    def add_to_watchlist(self, code: str, name: str, signal: str = "") -> bool:
+    def add_to_watchlist(self, code: str, name: str,
+                         signal: str = "", priority: str = "") -> bool:
+        """添加自选股；priority 为空时保留已有优先级"""
         try:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO watchlist VALUES (?,?,?,?)",
-                (code, name, signal, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            )
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._conn.execute("""
+                INSERT INTO watchlist(code, name, signal, added_time, priority)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(code) DO UPDATE SET
+                    name       = excluded.name,
+                    signal     = excluded.signal,
+                    added_time = excluded.added_time,
+                    priority   = CASE WHEN excluded.priority != ''
+                                      THEN excluded.priority
+                                      ELSE priority END
+            """, (code, name, signal, now, priority))
             self._conn.commit()
             return True
         except Exception:
             return False
+
+    def update_watchlist_priority(self, code: str, priority: str) -> bool:
+        """单独更新某只自选股的优先级（P1/P2/P3 或空字符串清除）"""
+        self._conn.execute(
+            "UPDATE watchlist SET priority=? WHERE code=?", (priority, code)
+        )
+        self._conn.commit()
+        return True
 
     def remove_from_watchlist(self, code: str) -> bool:
         self._conn.execute("DELETE FROM watchlist WHERE code=?", (code,))
@@ -468,10 +518,14 @@ class PaperAccount:
         self._conn.execute("DELETE FROM scan_results WHERE scan_date=?", (scan_date,))
         for r in results:
             self._conn.execute(
-                "INSERT INTO scan_results (scan_date,code,name,price,signal,reason,score,stop_price) "
-                "VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO scan_results "
+                "(scan_date,code,name,price,signal,reason,score,stop_price,rs_score,sector_dir,cross_date) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (scan_date, r["code"], r["name"], r["price"],
-                 r["signal"], r["reason"], r.get("score", 0), r.get("stop_price", 0))
+                 r["signal"], r["reason"],
+                 r.get("score", 0), r.get("stop_price", 0),
+                 r.get("rs_score", 0), r.get("sector_dir", ""),
+                 r.get("cross_date", ""))
             )
         self._conn.commit()
 
@@ -486,19 +540,29 @@ class PaperAccount:
             scan_date = row[0]
 
         rows = self._conn.execute(
-            "SELECT code,name,price,signal,reason,score,stop_price "
+            "SELECT code,name,price,signal,reason,score,stop_price,rs_score,sector_dir,cross_date "
             "FROM scan_results WHERE scan_date=? ORDER BY score DESC",
             (scan_date,)
         ).fetchall()
         return {
             "date": scan_date,
             "results": [
-                {"code": r[0], "name": r[1], "price": r[2], "signal": r[3],
-                 "reason": r[4], "score": r[5], "stop_price": r[6]}
+                {
+                    "code":       r[0],
+                    "name":       r[1],
+                    "price":      r[2],
+                    "signal":     r[3],
+                    "reason":     r[4],
+                    "score":      r[5],
+                    "stop_price": r[6],
+                    "rs_score":   r[7] if r[7] is not None else 0.0,
+                    "sector_dir": r[8] or "",
+                    "cross_date": r[9] or "",
+                }
                 for r in rows
             ]
         }
 
 
 # 全局单例（默认10万本金）
-paper = PaperAccount(init_capital=100_000)
+paper = PaperAccount(init_capital=200_000)
