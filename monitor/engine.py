@@ -25,6 +25,9 @@ SIGNAL_SIZE = {
     Signal.BUY_PULLBACK:     1.0,   # 回踩：1格（与金叉同等，信号最常见）
     Signal.BUY_SQUEEZE:      1.5,   # 粘合：1.5格（重点仓位）
 }
+
+# 分批止盈：浮盈达此值先卖半仓、剩余继续按规则跑（回测跨样本4/4验证有效）
+SCALE_PROFIT_PCT = 12.0
 from monitor.realtime import get_quotes, is_trading_time, is_market_open
 from monitor.intraday import engine as intraday_engine, Action
 from alert.notifier import (log, notify_buy, notify_sell, notify_warning,
@@ -47,6 +50,7 @@ class Position:
     peak_pnl:           float = 0.0   # 历史最高盈利%，用于回落保护止盈
     entry_signal:       str   = ""    # 买入触发信号（粘合/金叉/回踩），用于差异化止盈策略
     first_limit_up_date: str  = ""    # 粘合发散：首次当日涨幅≥9%的日期（YYYY-MM-DD）；空=未出现过
+    scaled:             bool  = False # 是否已分批止盈卖出过半仓
 
     @property
     def market_value(self) -> float:
@@ -87,7 +91,7 @@ class MonitorEngine:
         self.interval       = interval      # 轮询间隔（秒）
         self.paper_mode     = paper_mode    # True=模拟交易 / False=实盘（需接券商）
         self.user           = user          # 该引擎服务的用户（数据隔离）
-        self.max_positions  = 6             # 最多同时持仓6只
+        self.max_positions  = 4             # 最多同时持仓4只（寻优跨牛熊验证：降回撤）
         self.init_capital   = 200_000.0     # 总资金，用于计算每仓金额
         self.positions:  dict[str, Position]  = {}
         self.watchlist:  dict[str, WatchItem] = {}
@@ -188,6 +192,7 @@ class MonitorEngine:
                     stop_price=p.stop_price,
                     entry_time=getattr(p, "entry_time", ""),
                     entry_signal=getattr(p, "entry_signal", ""),
+                    scaled=bool(getattr(p, "scaled", 0)),
                 )
             log(f"加载持仓: {p.name}({code}) 成本={p.cost} "
                 f"止损={p.stop_price} {p.shares}股", "INFO")
@@ -281,6 +286,23 @@ class MonitorEngine:
                             pos = self.positions[code]
                     log(f"📌 {pos.name}({code}) 粘合发散首涨停日={_today}，今日持有观察", "INFO")
 
+            # 分批止盈：浮盈达 SCALE_PROFIT_PCT 先卖半仓，剩余继续按规则跑
+            # （次日起执行，受 T+1 约束；每仓只分批一次）
+            if (not pos.scaled and not self._is_bought_today(pos)
+                    and pnl_pct >= SCALE_PROFIT_PCT and self.paper_mode and self._paper):
+                half = (pos.shares // 200) * 100   # 卖一半，取整到100股
+                if half >= 100:
+                    ok, msg = self._paper.sell(
+                        code, price, qty=half,
+                        signal=f"分批止盈+{SCALE_PROFIT_PCT:.0f}%(卖半仓)")
+                    if ok:
+                        log(f"[分批] {msg}", "SELL")
+                        with self._lock:
+                            if code in self.positions:
+                                self.positions[code].shares -= half
+                                self.positions[code].scaled = True
+                                pos = self.positions[code]
+
             sig = intraday_engine.check_position(
                 code, daily_df, quote,
                 cost=pos.cost, stop_price=pos.stop_price,
@@ -332,26 +354,28 @@ class MonitorEngine:
         except Exception as _e:
             log(f"大盘数据获取失败，默认允许建仓: {_e}", "WARN")
 
-        # 购买优先级：① 粘合发散优先（突破蓄势，信号最强）
-        #             ② 同类型内按【盈亏比】优先：到止损距离越小=止损越紧=风险越低，优先买
-        #             ③ 盈亏比相同时以 P1/P2/P3 手动优先级兜底，再以评分兜底
+        # 购买优先级：① 手动优先级 P1/P2/P3 最优先（你指定的先占坑；未标的排最后）
+        #             ② 其次粘合发散优先（突破蓄势，信号最强）
+        #             ③ 再按【盈亏比】：到止损距离越小=止损越紧=风险越低，优先买
+        #             ④ 最后以评分兜底
         def _watch_sort_key(c: str):
             item = self.watchlist.get(c)
             if not item:
-                return (1, 9999.0, 99, 0)
+                return (99, 1, 9999.0, 0)
+            pri        = _PRIORITY_KEY.get(item.priority, 99)   # P1=1<P2=2<P3=3<未标=99
             is_squeeze = 0 if ("粘合" in item.signal or "发散" in item.signal) else 1
             q     = quotes.get(c) or {}
             price = q.get("price", 0) or 0
             risk  = self._risk_distance_pct(item, price)   # 越小越优先
-            return (is_squeeze, risk,
-                    _PRIORITY_KEY.get(item.priority, 99), -item.score)
+            return (pri, is_squeeze, risk, -item.score)
 
         watch_codes_sorted = sorted(watch_codes, key=_watch_sort_key)
 
         if watch_codes_sorted:
             top_items = [
                 f"{self.watchlist[c].name}({c})"
-                f"[{'粘合' if '粘合' in self.watchlist[c].signal else self.watchlist[c].signal[:2]}"
+                f"[{self.watchlist[c].priority or '自动'} "
+                f"{'粘合' if '粘合' in self.watchlist[c].signal else self.watchlist[c].signal[:2]}"
                 f" 止损距{self._risk_distance_pct(self.watchlist[c], (quotes.get(c) or {}).get('price', 0) or 0):.1f}%"
                 f" 分{self.watchlist[c].score}]"
                 for c in watch_codes_sorted if c in self.watchlist

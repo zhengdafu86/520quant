@@ -63,6 +63,18 @@ def _elapsed_min(dt_str: str) -> int:
     return 120 + max(0, t - open2)
 
 
+def _atr(daily, n: int = 14) -> float:
+    """日线 ATR(n)（价格单位）——用于波动率自适应止损"""
+    if daily is None or len(daily) < n + 1:
+        return 0.0
+    h = daily["high"].astype(float)
+    l = daily["low"].astype(float)
+    c = daily["close"].astype(float)
+    pc = c.shift(1)
+    tr = pd.concat([(h - l), (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    return float(tr.tail(n).mean())
+
+
 def _sig_mult(sig: str) -> float:
     if "粘合" in sig or "发散" in sig:
         return SIGNAL_SIZE[Signal.BUY_SQUEEZE]
@@ -132,7 +144,7 @@ def load_ctx(codes):
 
 
 def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
-             top_n=8):
+             top_n=8, atr_mult=0.0, scale_pct=0.0):
     """在 ctx 上跑一次忠实回测（使用 intraday 模块当前的止损/止盈参数）。
     top_n: 每日"精选"上限——只在评分最高的 top_n 只信号股里建仓（0=不设上限）。
     返回 (trades, equity_curve, positions)。"""
@@ -235,24 +247,47 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
                 quote = {"price": price, "last_close": last_close, "open": float(day[0][1]),
                          "high": runhigh, "low": runlow, "change_pct": chg, "vol_ratio": 1.0}
                 hd = date_idx.get(T, 0) - date_idx.get(pos["entry_date"], 0)
-                sig = IE.check_position(code, sub, quote, cost=pos["cost"],
-                                        stop_price=pos["stop"], peak_pnl=pos["peak"],
-                                        entry_signal=pos["sig"], first_limit_up_date=pos["flu"],
-                                        hold_days=hd)
-                if sig.action in (Action.SELL_STOP, Action.SELL_PROFIT):
+                pos["peak_price"] = max(pos.get("peak_price", price), price)
+
+                def _sell(qty, exit_name):
+                    nonlocal cash
                     exec_p = round(price * (1 - slippage), 3)
-                    gross = exec_p * pos["shares"]
+                    gross = exec_p * qty
                     fee = round(gross * (COMMISSION + STAMP_TAX), 2)
                     net = gross - fee
-                    cost_amt = pos["cost"] * pos["shares"]
-                    tpnl = round(net - cost_amt, 2)
+                    cost_amt = pos["cost"] * qty
                     cash += net
                     trades.append({"code": code, "name": names.get(code, code),
                                    "buy_date": pos["entry_date"], "sell_date": T,
-                                   "buy": pos["cost"], "sell": exec_p, "pnl": tpnl,
-                                   "pnl_pct": round(tpnl / cost_amt * 100, 2),
-                                   "sig": pos["sig"], "exit": sig.action.name})
-                    del positions[code]
+                                   "buy": pos["cost"], "sell": exec_p,
+                                   "pnl": round(net - cost_amt, 2),
+                                   "pnl_pct": round((net - cost_amt) / cost_amt * 100, 2),
+                                   "sig": pos["sig"], "exit": exit_name})
+
+                # 分批止盈：达到 scale_pct 先卖一半，剩余继续按规则跑
+                if scale_pct > 0 and not pos["scaled"] and pnl >= scale_pct:
+                    half = (pos["shares"] // 200) * 100
+                    if half >= 100:
+                        _sell(half, "SCALE_OUT")
+                        pos["shares"] -= half
+                        pos["scaled"] = True
+
+                # 止损/止盈决策
+                sold = False
+                if atr_mult > 0 and pos["atr"] > 0:
+                    chand = pos["peak_price"] - atr_mult * pos["atr"]
+                    if price <= chand:
+                        _sell(pos["shares"], "ATR_STOP"); del positions[code]; sold = True
+                if not sold:
+                    sig = IE.check_position(code, sub, quote, cost=pos["cost"],
+                                            stop_price=pos["stop"], peak_pnl=pos["peak"],
+                                            entry_signal=pos["sig"], first_limit_up_date=pos["flu"],
+                                            hold_days=hd)
+                    # ATR 模式下止损由吊灯接管，只采纳 check_position 的止盈
+                    take = (sig.action == Action.SELL_PROFIT) if atr_mult > 0 \
+                           else (sig.action in (Action.SELL_STOP, Action.SELL_PROFIT))
+                    if take:
+                        _sell(pos["shares"], sig.action.name); del positions[code]
 
             # ── 进场 ──
             if mkt_ok:
@@ -290,7 +325,9 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
                         cash -= amt + fee
                         positions[code] = {"cost": exec_p, "shares": shares,
                                            "stop": round(exec_p * 0.95, 2), "peak": 0.0,
-                                           "sig": stype, "entry_date": T, "flu": ""}
+                                           "sig": stype, "entry_date": T, "flu": "",
+                                           "atr": _atr(sub), "peak_price": exec_p,
+                                           "scaled": False}
 
         # 当日收盘市值（按各股当日最后一根5分钟收盘）
         pv = 0.0
@@ -354,6 +391,8 @@ def main():
     ap.add_argument("--capital", type=float, default=200_000)
     ap.add_argument("--slippage", type=float, default=0.0)
     ap.add_argument("--top-n", type=int, default=8, help="每日精选上限(0=不限)")
+    ap.add_argument("--atr-mult", type=float, default=0.0, help="ATR吊灯止损倍数(0=关,用现行MA20止损)")
+    ap.add_argument("--scale-pct", type=float, default=0.0, help="分批止盈:浮盈达此%先卖半仓(0=关)")
     a = ap.parse_args()
 
     universe = build_universe(a.sample, a.seed)
@@ -363,7 +402,8 @@ def main():
     ctx = load_ctx(list(names))
     print(f"  有效数据: {len(ctx['daily'])} 只")
     trades, ec, pos = simulate(ctx, names, a.start, a.end, a.max_pos, a.capital,
-                               a.slippage, top_n=a.top_n)
+                               a.slippage, top_n=a.top_n,
+                               atr_mult=a.atr_mult, scale_pct=a.scale_pct)
     _report(metrics(trades, ec, pos, a.capital, ctx["mk"]), ec)
 
 

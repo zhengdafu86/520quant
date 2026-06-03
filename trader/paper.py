@@ -71,6 +71,7 @@ class PaperPosition:
     stop_price:   float
     entry_time:   str
     entry_signal: str = ""     # 买入触发信号（信号类型 | 原因）
+    scaled:       int = 0      # 是否已分批止盈卖出过半仓（0/1）
 
     def market_value(self, price: float) -> float:
         return price * self.shares
@@ -110,7 +111,8 @@ def _init_db(conn: sqlite3.Connection):
             shares       INTEGER,
             stop_price   REAL,
             entry_time   TEXT,
-            entry_signal TEXT DEFAULT ''
+            entry_signal TEXT DEFAULT '',
+            scaled       INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS watchlist (
@@ -165,6 +167,13 @@ def _init_db(conn: sqlite3.Connection):
     # 迁移：positions 加 entry_signal 列（买入触发信号）
     try:
         conn.execute("ALTER TABLE positions ADD COLUMN entry_signal TEXT DEFAULT ''")
+        conn.commit()
+    except Exception:
+        pass   # 列已存在，忽略
+
+    # 迁移：positions 加 scaled 列（分批止盈是否已卖半仓）
+    try:
+        conn.execute("ALTER TABLE positions ADD COLUMN scaled INTEGER DEFAULT 0")
         conn.commit()
     except Exception:
         pass   # 列已存在，忽略
@@ -315,7 +324,8 @@ class PaperAccount:
             result[r[0]] = PaperPosition(
                 code=r[0], name=r[1], cost=r[2],
                 shares=r[3], stop_price=r[4], entry_time=r[5],
-                entry_signal=r[6] if len(r) > 6 else ""
+                entry_signal=r[6] if len(r) > 6 else "",
+                scaled=int(r[7]) if len(r) > 7 and r[7] is not None else 0
             )
         return result
 
@@ -329,7 +339,8 @@ class PaperAccount:
         return PaperPosition(
             code=r[0], name=r[1], cost=r[2],
             shares=r[3], stop_price=r[4], entry_time=r[5],
-            entry_signal=r[6] if len(r) > 6 else ""
+            entry_signal=r[6] if len(r) > 6 else "",
+            scaled=int(r[7]) if len(r) > 7 and r[7] is not None else 0
         )
 
     def update_stop(self, code: str, new_stop: float) -> bool:
@@ -390,10 +401,10 @@ class PaperAccount:
         # 写入持仓
         stop = stop_price or round(price * 0.95, 2)
         self._conn.execute(
-            "INSERT OR REPLACE INTO positions VALUES (?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO positions VALUES (?,?,?,?,?,?,?,?)",
             (code, name, price, shares, stop,
              datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-             entry_signal)
+             entry_signal, 0)
         )
 
         # 扣减现金
@@ -407,10 +418,11 @@ class PaperAccount:
 
     def sell(self, code: str, price: float,
              signal: str = "",
-             conditions: list = None) -> tuple[bool, str]:
+             conditions: list = None,
+             qty: int = None) -> tuple[bool, str]:
         """
-        模拟卖出（全仓）
-        返回 (成功, 消息)
+        模拟卖出。qty 为 None 或 ≥持仓时全仓清；qty<持仓时为分批卖出（卖出部分、
+        剩余继续持有并标记 scaled=1）。返回 (成功, 消息)。
         """
         pos = self.get_position(code)
         if not pos:
@@ -421,32 +433,43 @@ class PaperAccount:
         if pos.entry_time and pos.entry_time[:10] == today:
             return False, f"T+1限制：{code} 当日买入，不可当日卖出（{pos.entry_time[:10]}）"
 
-        amount     = round(price * pos.shares, 2)
+        partial     = qty is not None and 0 < int(qty) < pos.shares
+        sell_shares = int(qty) if partial else pos.shares
+        if sell_shares <= 0:
+            return False, "卖出数量无效"
+
+        amount     = round(price * sell_shares, 2)
         commission = round(amount * 0.0001, 2)
         stamp_tax  = round(amount * 0.001, 2)     # 印花税（卖出单边）
         total_fee  = commission + stamp_tax
         net_amount = amount - total_fee
-        pnl        = round(net_amount - pos.cost * pos.shares, 2)
-        pnl_pct    = round(pnl / (pos.cost * pos.shares) * 100, 2)
+        pnl        = round(net_amount - pos.cost * sell_shares, 2)
+        pnl_pct    = round(pnl / (pos.cost * sell_shares) * 100, 2)
 
         # 写入订单
         self._conn.execute(
             "INSERT INTO orders (code,name,side,price,shares,amount,signal,timestamp,conditions) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
-            (code, pos.name, "SELL", price, pos.shares, amount, signal,
+            (code, pos.name, "SELL", price, sell_shares, amount, signal,
              datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
              json.dumps(conditions or [], ensure_ascii=False))
         )
 
-        # 删除持仓
-        self._conn.execute("DELETE FROM positions WHERE code=?", (code,))
+        if partial:
+            # 分批：减仓 + 标记已分批，剩余继续持有
+            self._conn.execute(
+                "UPDATE positions SET shares = shares - ?, scaled = 1 WHERE code=?",
+                (sell_shares, code))
+        else:
+            self._conn.execute("DELETE FROM positions WHERE code=?", (code,))
 
         # 增加现金
         self._set("cash", self.cash + net_amount)
         self._conn.commit()
 
-        msg = (f"模拟卖出 {pos.name}({code}) "
-               f"{price:.2f}×{pos.shares}股 "
+        tag = "分批卖出" if partial else "模拟卖出"
+        msg = (f"{tag} {pos.name}({code}) "
+               f"{price:.2f}×{sell_shares}股 "
                f"盈亏={pnl:+.0f}元({pnl_pct:+.1f}%) "
                f"费用={total_fee:.1f}")
         return True, msg

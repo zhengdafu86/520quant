@@ -508,39 +508,58 @@ def api_trades():
     for code, data in stock_map.items():
         orders = data["orders"]
 
-        # 用队列匹配买卖，计算每笔完整交易收益
-        # 以 SELL 订单的 voided 状态决定该笔交易是否失效
-        buy_queue = []
+        # 按【股数】FIFO 匹配买卖（支持分批卖出：1个买单可对多个卖单）
+        # 每个卖单从最前买单逐股扣减，盈亏只算匹配到的股数
+        buy_queue = []   # 每项含 remaining 剩余未匹配股数
         completed = []
         for o in orders:
             if o["side"] == "BUY":
-                buy_queue.append(o)
-            elif o["side"] == "SELL" and buy_queue:
-                buy = buy_queue.pop(0)
-                commission = round((buy["amount"] + o["amount"]) * 0.0001, 2)
-                stamp_tax  = round(o["amount"] * 0.001, 2)
-                pnl        = round(o["amount"] - buy["amount"] - commission - stamp_tax, 2)
-                pnl_pct    = round(pnl / buy["amount"] * 100, 2)
+                buy_queue.append({**o, "remaining": o["shares"]})
+            elif o["side"] == "SELL":
+                sell_rem = o["shares"]
+                matched_shares = 0
+                matched_buy_amount = 0.0
+                first_buy = None
+                while sell_rem > 0 and buy_queue:
+                    b = buy_queue[0]
+                    take = min(sell_rem, b["remaining"])
+                    if first_buy is None:
+                        first_buy = b
+                    matched_shares     += take
+                    matched_buy_amount += take * b["price"]
+                    b["remaining"] -= take
+                    sell_rem       -= take
+                    if b["remaining"] <= 0:
+                        buy_queue.pop(0)
+                if matched_shares <= 0 or first_buy is None:
+                    continue
+                sell_amount = round(o["price"] * matched_shares, 2)
+                buy_amount  = round(matched_buy_amount, 2)
+                commission  = round((buy_amount + sell_amount) * 0.0001, 2)
+                stamp_tax   = round(sell_amount * 0.001, 2)
+                pnl         = round(sell_amount - buy_amount - commission - stamp_tax, 2)
+                pnl_pct     = round(pnl / buy_amount * 100, 2) if buy_amount else 0
                 completed.append({
-                    "sell_order_id":  o["id"],       # 用于失效操作
-                    "buy_price":      buy["price"],
+                    "sell_order_id":  o["id"],
+                    "buy_price":      first_buy["price"],
                     "sell_price":     o["price"],
-                    "shares":         o["shares"],
-                    "buy_amount":     buy["amount"],
-                    "sell_amount":    o["amount"],
+                    "shares":         matched_shares,
+                    "buy_amount":     buy_amount,
+                    "sell_amount":    sell_amount,
                     "pnl":            pnl,
                     "pnl_pct":        pnl_pct,
-                    "buy_time":       buy["timestamp"],
+                    "buy_time":       first_buy["timestamp"],
                     "sell_time":      o["timestamp"],
-                    "buy_signal":     buy["signal"],  # 买入触发原因
-                    "sell_signal":    o["signal"],    # 卖出触发原因
+                    "buy_signal":     first_buy["signal"],
+                    "sell_signal":    o["signal"],
                     "voided":         o["voided"],
-                    "buy_conditions":  buy.get("conditions", []),
+                    "buy_conditions":  first_buy.get("conditions", []),
                     "sell_conditions": o.get("conditions", []),
                 })
 
-        # 还在持仓中的买单（未平仓）
+        # 还在持仓中的买单（未平仓）：剩余未匹配股数
         open_buy = buy_queue[0] if buy_queue else None
+        open_shares = sum(b["remaining"] for b in buy_queue) if buy_queue else None
 
         # 仅有效（非失效）交易计入统计
         active = [t for t in completed if not t["voided"]]
@@ -554,7 +573,7 @@ def api_trades():
             "trades":        completed,
             "open":          open_buy is not None,
             "open_price":    open_buy["price"]      if open_buy else None,
-            "open_shares":   open_buy["shares"]     if open_buy else None,
+            "open_shares":   open_shares            if open_buy else None,
             "open_time":     open_buy["timestamp"]  if open_buy else None,
             "open_signal":   open_buy["signal"]     if open_buy else "",
             "open_conditions": open_buy.get("conditions", []) if open_buy else [],
