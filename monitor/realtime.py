@@ -137,8 +137,10 @@ def get_quote(code: str) -> dict:
 
 def get_minute_bars(code: str, freq: str = "1m", count: int = 60):
     """
-    mootdx 分钟K线
+    分钟K线（腾讯源）
     freq: '1m' / '5m' / '15m' / '30m' / '60m'
+    注：直连 IP 的 mootdx 只返回日线、无分钟数据，故分钟K统一走腾讯接口。
+        返回 DataFrame[datetime, open, high, low, close, vol]。
     """
-    from data.fetcher import db
-    return db.get(code, freq=freq, bars=count)
+    from data.fetcher import fetch_minute
+    return fetch_minute(code, freq=freq, count=max(count, 64))

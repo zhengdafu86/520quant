@@ -410,6 +410,8 @@ def api_watchlist():
         w["scan_rs"]          = hit.get("rs_score",    None) if hit else None
         w["scan_sector_dir"]  = hit.get("sector_dir",  "")   if hit else ""
         w["scan_sector_name"] = hit.get("sector_name", "")   if hit else ""
+        w["ai_score"]         = hit.get("ai_score",    0)    if hit else 0
+        w["ai_comment"]       = hit.get("ai_comment",  "")   if hit else ""
 
     return jsonify(wlist)
 
@@ -515,7 +517,7 @@ def api_trades():
                 buy_queue.append(o)
             elif o["side"] == "SELL" and buy_queue:
                 buy = buy_queue.pop(0)
-                commission = round((buy["amount"] + o["amount"]) * 0.0003, 2)
+                commission = round((buy["amount"] + o["amount"]) * 0.0001, 2)
                 stamp_tax  = round(o["amount"] * 0.001, 2)
                 pnl        = round(o["amount"] - buy["amount"] - commission - stamp_tax, 2)
                 pnl_pct    = round(pnl / buy["amount"] * 100, 2)

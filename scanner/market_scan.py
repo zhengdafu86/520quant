@@ -58,6 +58,12 @@ def _save_industry_cache(cache: dict[str, str]):
         log(f"行业缓存写入失败（不影响扫描）: {e}", "WARN")
 
 
+# ── 不可交易板块过滤（创业板 300/301、科创板 688/689）────────────
+# 账户无对应权限，直接从扫描源头剔除，连分析都不做。
+def _is_excluded_board(code: str) -> bool:
+    return str(code).startswith(("300", "301", "688", "689"))
+
+
 # ── 基础过滤参数 ──────────────────────────────────────
 SCAN_MIN_PRICE    = 5.0      # 最低股价（元）
 SCAN_MAX_PRICE    = 200.0    # 最高股价（元）
@@ -200,15 +206,11 @@ class MarketScanner:
 
     @staticmethod
     def _builtin_codes() -> list[str]:
-        """内置 A 股代码范围（备用）"""
+        """内置 A 股代码范围（备用）——仅主板，不含创业板/科创板（不可交易）"""
         codes = []
         for i in range(1, 3800):          # 深圳主板 000001~003799
             codes.append(str(i).zfill(6))
-        for i in range(300001, 301800):   # 创业板
-            codes.append(str(i))
         for i in range(600000, 605000):   # 上海主板
-            codes.append(str(i))
-        for i in range(688001, 688800):   # 科创板
             codes.append(str(i))
         return codes
 
@@ -222,6 +224,12 @@ class MarketScanner:
           ③ 基本面-市值：流通市值 < 30亿 或 > 800亿
         返回 [(code, name, price), ...]
         """
+        # 板块过滤：剔除不可交易的创业板/科创板（账户无权限）
+        _before = len(codes)
+        codes = [c for c in codes if not _is_excluded_board(c)]
+        if _before != len(codes):
+            log(f"板块过滤: 排除创业板/科创板 {_before - len(codes)} 只（不可交易）", "INFO")
+
         log(f"预过滤: {len(codes)} 只 → 批量报价中...", "INFO")
         quotes = _batch_quotes(codes)
 

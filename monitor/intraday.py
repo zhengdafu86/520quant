@@ -13,6 +13,14 @@ from datetime import datetime
 from monitor.realtime import (get_quote, get_minute_bars,
                               is_buy_window, is_profit_exit_window)
 
+# ── 可寻优参数（默认 = 现行实盘值；回测寻优时由 sweep 覆盖，不影响线上）──
+HARD_STOP_PCT     = -5.0   # ① 硬止损阈值(%)
+TREND_STOP_BARS   = 2      # ② 趋势止损：近若干根5分钟K中跌破MA20的根数阈值（默认2=现行"3中2"）
+DD_THRESH_MULT    = 1.0    # ⑤ 浮盈回落容忍倍数（>1 = 放宽、更能扛回调、拉长持有）
+DISABLE_PEAK_LOCK = False  # 三合二：关掉⑥峰值锁利（与追踪止损大量重叠）
+MAX_HOLD_DAYS     = 0      # ⑦ 条件时间止损：持有交易日上限（0=关）
+STALE_PNL         = 3.0    # ⑦ 老仓清理盈利门槛(%)：持有超限且盈利<此值才清坑让位
+
 
 class Action(Enum):
     BUY         = "立即买入"
@@ -242,19 +250,19 @@ class IntradayEngine:
         s = entry_signal or ""
         if "粘合" in s or "发散" in s:
             return {
-                "dd_thresh":    8.0,   # 峰值回落容忍（pp），宽松
+                "dd_thresh":    8.0 * DD_THRESH_MULT,   # 峰值回落容忍（pp），宽松
                 "peak_lock_hi": 12.0,  # 峰值达到此值后开始锁利
                 "peak_lock_lo": 12.0,  # 回落至此值触发止盈
             }
         if "回踩" in s:
             return {
-                "dd_thresh":    3.0,   # 峰值回落容忍（pp），收紧
+                "dd_thresh":    3.0 * DD_THRESH_MULT,   # 峰值回落容忍（pp），收紧
                 "peak_lock_hi": 8.0,
                 "peak_lock_lo": 8.0,
             }
         # 金叉 or 默认
         return {
-            "dd_thresh":    5.0,
+            "dd_thresh":    5.0 * DD_THRESH_MULT,
             "peak_lock_hi": 10.0,
             "peak_lock_lo": 10.0,
         }
@@ -264,7 +272,8 @@ class IntradayEngine:
                        stop_price: float,
                        peak_pnl: float = 0.0,
                        entry_signal: str = "",
-                       first_limit_up_date: str = "") -> IntradaySignal:
+                       first_limit_up_date: str = "",
+                       hold_days: int = 0) -> IntradaySignal:
         """
         持仓实时止损止盈（每30秒调用）
         每一步检查结果都记录在 IntradaySignal.conditions 里
@@ -281,19 +290,20 @@ class IntradayEngine:
         pnl_pct = (price - cost) / cost * 100
 
         # ① 硬止损
-        if pnl_pct <= -5.0:
-            conds.append(["①硬止损", False, f"盈亏{pnl_pct:.1f}%≤-5%，触发硬止损"])
+        if pnl_pct <= HARD_STOP_PCT:
+            conds.append(["①硬止损", False, f"盈亏{pnl_pct:.1f}%≤{HARD_STOP_PCT:.0f}%，触发硬止损"])
             return IntradaySignal(Action.SELL_STOP, price,
-                f"亏损{pnl_pct:.1f}%，触发止损（成本×95%）", urgency="urgent", conditions=conds)
-        conds.append(["①硬止损", True, f"盈亏{pnl_pct:.1f}%>-5%，未触发"])
+                f"亏损{pnl_pct:.1f}%，触发硬止损", urgency="urgent", conditions=conds)
+        conds.append(["①硬止损", True, f"盈亏{pnl_pct:.1f}%>{HARD_STOP_PCT:.0f}%，未触发"])
 
         # ② 趋势止损
         if price < ma20:
-            min_df = get_minute_bars(code, freq="5m", count=10)
+            _win = max(3, TREND_STOP_BARS)
+            min_df = get_minute_bars(code, freq="5m", count=max(10, _win))
             below  = 0
             if min_df is not None and not min_df.empty:
-                below = sum(1 for c in min_df["close"].tail(3) if c < ma20)
-            if below >= 2:
+                below = sum(1 for c in min_df["close"].tail(_win) if c < ma20)
+            if below >= TREND_STOP_BARS:
                 conds.append(["②趋势止损", False,
                     f"价格{price:.2f}<MA20={ma20:.2f}，连续{below}根5分钟K确认跌破，触发趋势止损"])
                 return IntradaySignal(Action.SELL_STOP, price,
@@ -396,8 +406,8 @@ class IntradayEngine:
         conds.append(["⑤浮盈回落", True,
             f"峰值{peak_pnl:.1f}%→当前{pnl_pct:.1f}%，回落{drop:.1f}pp<{ep['dd_thresh']}pp，保护未触发"])
 
-        # ⑥ 峰值锁利
-        if peak_pnl >= ep["peak_lock_hi"] and pnl_pct <= ep["peak_lock_lo"]:
+        # ⑥ 峰值锁利（DISABLE_PEAK_LOCK=True 时关闭，做"三合二"精简）
+        if (not DISABLE_PEAK_LOCK) and peak_pnl >= ep["peak_lock_hi"] and pnl_pct <= ep["peak_lock_lo"]:
             if _in_exit_win:
                 conds.append(["⑥峰值锁利", False,
                     f"峰值{peak_pnl:.1f}%≥{ep['peak_lock_hi']}%，当前{pnl_pct:.1f}%≤{ep['peak_lock_lo']}%，窗口内锁利"])
@@ -411,6 +421,15 @@ class IntradayEngine:
                 conditions=conds)
         conds.append(["⑥峰值锁利", True,
             f"峰值{peak_pnl:.1f}%，当前{pnl_pct:.1f}%，锁利条件（峰值≥{ep['peak_lock_hi']}%且回落至≤{ep['peak_lock_lo']}%）未达"])
+
+        # ⑦ 条件时间止损：又老又没动的仓，清坑让位给更好信号（默认关）
+        if MAX_HOLD_DAYS > 0 and hold_days >= MAX_HOLD_DAYS and pnl_pct < STALE_PNL:
+            conds.append(["⑦时间止损", False,
+                f"持有{hold_days}天≥{MAX_HOLD_DAYS}且盈利{pnl_pct:.1f}%<{STALE_PNL}%，停滞清坑"])
+            return IntradaySignal(
+                Action.SELL_PROFIT if pnl_pct >= 0 else Action.SELL_STOP, price,
+                f"持有{hold_days}天停滞(盈亏{pnl_pct:+.1f}%)，时间止损让位",
+                urgency="urgent", conditions=conds)
 
         conds.append(["持仓状态", True,
             f"盈亏={pnl_pct:.1f}% | 峰值={peak_pnl:.1f}% | MA5={ma5:.2f} MA20={ma20:.2f}"])

@@ -21,7 +21,7 @@ from data.fetcher import db
 from strategy.signal_520 import strategy, Signal
 
 
-COMMISSION = 0.0003   # 万3 佣金（买卖双向）
+COMMISSION = 0.0001   # 万1 佣金（买卖双向）
 STAMP_TAX  = 0.001    # 千1 印花税（仅卖出）
 
 MIN_TURNOVER = 3_000   # 最低流动性：5日均成交额 3000万元（单位：万元）
@@ -50,9 +50,11 @@ class Trade:
 
 class Backtester:
 
-    def __init__(self, init_capital: float = 200_000, max_positions: int = 4):
+    def __init__(self, init_capital: float = 200_000, max_positions: int = 4,
+                 slippage: float = 0.0):
         self.init_capital  = init_capital
         self.max_positions = max_positions
+        self.slippage      = slippage   # 每边滑点（如 0.001 = 0.1%）：买价↑、卖价↓
 
     def run(self, stocks: list[dict], bars: int = 250,
             start_date: str = "", end_date: str = "",
@@ -208,11 +210,13 @@ class Backtester:
                     elif not is_breakout and not is_pullback and (gap_pct >= 8.0 or gap_pct <= -3.0):
                         del pending_buys[code]; continue
 
-                shares = int(pos_size / price / 100) * 100
+                # 滑点：买入实际成交价高于开盘价（gap 过滤仍用原始开盘价，保持真实）
+                exec_price = round(price * (1 + self.slippage), 2)
+                shares = int(pos_size / exec_price / 100) * 100
                 if shares < 100:
                     del pending_buys[code]
                     continue
-                buy_amt = price * shares
+                buy_amt = exec_price * shares
                 fee     = round(buy_amt * COMMISSION, 2)
                 if cash < buy_amt + fee:
                     del pending_buys[code]
@@ -221,7 +225,7 @@ class Backtester:
                 cash -= buy_amt + fee
                 positions[code] = {
                     "name":        pb["name"],
-                    "buy_price":   price,
+                    "buy_price":   exec_price,
                     "shares":      shares,
                     "signal_date": pb["signal_date"],
                     "buy_date":    date_str,
@@ -257,8 +261,10 @@ class Backtester:
 
                 if result.signal.is_exit():
                     price   = day_close.get(code, pos["buy_price"])
+                    # 滑点：卖出实际成交价低于收盘价
+                    exec_price = round(price * (1 - self.slippage), 2)
                     shares  = pos["shares"]
-                    gross   = price * shares
+                    gross   = exec_price * shares
                     fee     = round(gross * (COMMISSION + STAMP_TAX), 2)
                     net     = gross - fee
                     buy_amt = pos["buy_price"] * shares
@@ -269,7 +275,7 @@ class Backtester:
                         code=code, name=pos["name"],
                         signal_date=pos["signal_date"],
                         buy_date=pos["buy_date"], sell_date=date_str,
-                        buy_price=pos["buy_price"], sell_price=price,
+                        buy_price=pos["buy_price"], sell_price=exec_price,
                         shares=shares, pnl=pnl, pnl_pct=pnl_pct,
                         hold_days=pos["hold_days"],
                         signal=pos["signal"],

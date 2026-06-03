@@ -231,16 +231,23 @@ def _init_scan_db(conn: sqlite3.Connection):
             cross_date   TEXT DEFAULT '',
             sector_name  TEXT DEFAULT '',
             score_detail TEXT DEFAULT '[]',
-            change_pct   REAL DEFAULT 0
+            change_pct   REAL DEFAULT 0,
+            ai_score     REAL DEFAULT 0,
+            ai_comment   TEXT DEFAULT ''
         );
     """)
     conn.commit()
-    # 迁移：老 market.db 可能没有 change_pct 列（当日涨跌幅）
-    try:
-        conn.execute("ALTER TABLE scan_results ADD COLUMN change_pct REAL DEFAULT 0")
-        conn.commit()
-    except Exception:
-        pass   # 列已存在，忽略
+    # 迁移：老 market.db 补列
+    for col, ddl in (
+        ("change_pct", "REAL DEFAULT 0"),
+        ("ai_score",   "REAL DEFAULT 0"),    # AI 综合评分（技术+资金+消息）
+        ("ai_comment", "TEXT DEFAULT ''"),   # AI 评分理由（一句话）
+    ):
+        try:
+            conn.execute(f"ALTER TABLE scan_results ADD COLUMN {col} {ddl}")
+            conn.commit()
+        except Exception:
+            pass   # 列已存在，忽略
 
 
 # ── 模拟账户 ──────────────────────────────────────────────
@@ -354,7 +361,7 @@ class PaperAccount:
             return False, "买入数量不足100股"
 
         amount = round(price * shares, 2)
-        commission = round(amount * 0.0003, 2)   # 万3佣金
+        commission = round(amount * 0.0001, 2)   # 万1佣金
         total_cost = amount + commission
 
         if total_cost > self.cash:
@@ -363,7 +370,7 @@ class PaperAccount:
                 return False, f"现金不足（剩余 {self.cash:.0f} 元）"
             shares = max_shares
             amount = round(price * shares, 2)
-            commission = round(amount * 0.0003, 2)
+            commission = round(amount * 0.0001, 2)
             total_cost = amount + commission
 
         # 检查是否已有持仓（不加仓）
@@ -415,7 +422,7 @@ class PaperAccount:
             return False, f"T+1限制：{code} 当日买入，不可当日卖出（{pos.entry_time[:10]}）"
 
         amount     = round(price * pos.shares, 2)
-        commission = round(amount * 0.0003, 2)
+        commission = round(amount * 0.0001, 2)
         stamp_tax  = round(amount * 0.001, 2)     # 印花税（卖出单边）
         total_fee  = commission + stamp_tax
         net_amount = amount - total_fee
@@ -628,7 +635,7 @@ class PaperAccount:
         _, buy_amount = paired_buy
 
         # ── 计算该笔交易净盈亏（与 api_trades 公式一致）──
-        commission = round((buy_amount + sell_amount) * 0.0003, 2)
+        commission = round((buy_amount + sell_amount) * 0.0001, 2)
         stamp_tax  = round(sell_amount * 0.001, 2)
         pnl        = round(sell_amount - buy_amount - commission - stamp_tax, 2)
 
@@ -731,7 +738,7 @@ class PaperAccount:
         rows = self._scan_conn.execute(
             "SELECT code,name,price,signal,reason,score,stop_price,"
             "rs_score,sector_dir,cross_date,sector_name,score_detail,"
-            "COALESCE(change_pct,0) "
+            "COALESCE(change_pct,0),COALESCE(ai_score,0),COALESCE(ai_comment,'') "
             "FROM scan_results WHERE scan_date=? ORDER BY score DESC",
             (scan_date,)
         ).fetchall()
@@ -752,10 +759,39 @@ class PaperAccount:
                     "sector_name":  r[10] or "",
                     "score_detail": json.loads(r[11]) if r[11] else [],
                     "change_pct":   r[12] if r[12] is not None else 0.0,
+                    "ai_score":     r[13] if r[13] is not None else 0.0,
+                    "ai_comment":   r[14] or "",
                 }
                 for r in rows
             ]
         }
+
+    def update_ai_scores(self, scores: dict, scan_date: str = None) -> int:
+        """
+        把 AI 评分写回扫描结果（仅展示参考，不碰交易）。
+        scores: {code: {"ai_score": 0-100, "ai_comment": "理由"}}
+        scan_date 为空时取最新一天。返回更新条数。
+        """
+        if not scan_date:
+            row = self._scan_conn.execute(
+                "SELECT scan_date FROM scan_results ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if not row:
+                return 0
+            scan_date = row[0]
+        n = 0
+        for code, v in (scores or {}).items():
+            try:
+                cur = self._scan_conn.execute(
+                    "UPDATE scan_results SET ai_score=?, ai_comment=? "
+                    "WHERE scan_date=? AND code=?",
+                    (float(v.get("ai_score", 0)), str(v.get("ai_comment", "")),
+                     scan_date, code))
+                n += cur.rowcount
+            except Exception:
+                pass
+        self._scan_conn.commit()
+        return n
 
 
 # 全局单例（懒加载）

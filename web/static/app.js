@@ -371,6 +371,14 @@ function _renderWatchCards(list) {
     const watchScoreDetailHtml = (hasScan && w.scan_score_detail && w.scan_score_detail.length)
       ? _scoreDetailHtml(w.scan_score_detail) : '';
 
+    /* ── AI 综合评分（从扫描结果同步）── */
+    const wAi      = w.ai_score || 0;
+    const wAiCls   = wAi >= 85 ? 'ai-high' : wAi >= 70 ? 'ai-mid' : 'ai-low';
+    const wAiBadge = wAi > 0
+      ? `<span class="ai-badge ${wAiCls}" title="AI综合评分(技术+资金+消息)">🤖 AI ${Math.round(wAi)}</span>` : '';
+    const wAiComment = (wAi > 0 && w.ai_comment)
+      ? `<div class="ai-comment">🤖 ${_esc(w.ai_comment)}</div>` : '';
+
     /* ── 扫描信号详情 ── */
     const descHtml = (hasScan && w.scan_reason)
       ? `<div class="scan-desc mt-2">
@@ -404,10 +412,12 @@ function _renderWatchCards(list) {
         ${rsHtml}
         ${crossDateHtml}
         ${stopHtml}
+        ${wAiBadge}
         <span class="text-muted" style="margin-left:auto;font-size:11px">
           加入 ${(w.added_time||'').slice(0,10)}
         </span>
       </div>
+      ${wAiComment}
       ${watchScoreDetailHtml}
       ${descHtml}
     </div>`;
@@ -551,11 +561,16 @@ function applyScanFilters() {
     data = data.filter(r => !_scanWatchSet.has(r.code));
   }
 
-  // RS 排序（default 保持服务端 score+rs 排序）
-  if (_scanFilters.rsSort === 'rs_desc') {
+  // 排序（default 保持服务端 score+rs 排序）
+  const sv = _scanFilters.rsSort;
+  if (sv === 'rs_desc') {
     data.sort((a, b) => ((b.rs_score ?? -9999) - (a.rs_score ?? -9999)));
-  } else if (_scanFilters.rsSort === 'rs_asc') {
+  } else if (sv === 'rs_asc') {
     data.sort((a, b) => ((a.rs_score ?? 9999) - (b.rs_score ?? 9999)));
+  } else if (sv === 'ai_desc') {
+    data.sort((a, b) => ((b.ai_score || 0) - (a.ai_score || 0)));
+  } else if (sv === 'ai_asc') {
+    data.sort((a, b) => ((a.ai_score || 0) - (b.ai_score || 0)));
   }
 
   // 更新计数提示
@@ -619,6 +634,14 @@ function _renderScanCards(list) {
     const isPick   = _scanPickSet.has(r.code);
     const pickBadge = isPick ? `<span class="pick-badge">🌟 精选</span>` : '';
 
+    // AI 综合评分（技术+资金+消息，仅展示参考）
+    const aiScore = r.ai_score || 0;
+    const aiCls   = aiScore >= 85 ? 'ai-high' : aiScore >= 70 ? 'ai-mid' : 'ai-low';
+    const aiBadge = aiScore > 0
+      ? `<span class="ai-badge ${aiCls}" title="AI综合评分(技术+资金+消息)">🤖 AI ${Math.round(aiScore)}</span>` : '';
+    const aiComment = (aiScore > 0 && r.ai_comment)
+      ? `<div class="ai-comment">🤖 ${_esc(r.ai_comment)}</div>` : '';
+
     // 当日涨跌幅（A股：红涨绿跌）
     const chg     = r.change_pct || 0;
     const chgCls  = chg > 0 ? 'up' : chg < 0 ? 'down' : 'flat';
@@ -648,11 +671,19 @@ function _renderScanCards(list) {
         ${crossHtml}
         ${stopHtml}
         ${scoreHtml}
+        ${aiBadge}
       </div>
+      ${aiComment}
       ${scoreDetailHtml}
       <div class="scan-desc mt-2">${descHtml}</div>
     </div>`;
   }).join('');
+}
+
+/* HTML 转义（AI 理由文本安全展示）*/
+function _esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g,
+    c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
 
 /* ── 扫描结果 ────────────────────────────────── */

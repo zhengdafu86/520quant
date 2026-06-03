@@ -782,9 +782,10 @@ class MultiUserMonitor:
 
     def _loop(self):
         log(f"多用户监控引擎启动 ✅（{len(self.engines)} 用户）")
-        _summary_sent = False
-        _scan_sent    = False
-        _df_refreshed = False
+        _summary_sent   = False
+        _scan_sent      = False
+        _df_refreshed   = False
+        _intraday_saved = False
         while self._running:
             now = datetime.now()
 
@@ -813,9 +814,22 @@ class MultiUserMonitor:
                 threading.Thread(target=scanner.run, daemon=True).start()
                 _scan_sent = True
 
+            # 15:40 盘中分钟数据落库（扫描后，覆盖当日完整 5 分钟K；后台线程）
+            # 为忠实回测 check_entry/check_position 向前积累历史
+            if now.hour == 15 and now.minute == 40 and not _intraday_saved:
+                def _save_intraday():
+                    try:
+                        from data.intraday_store import collect_default
+                        ok, total, n = collect_default()
+                        log(f"盘中分钟数据落库: {ok}/{n} 只，{total} 根5分钟K", "INFO")
+                    except Exception as e:
+                        log(f"分钟数据落库失败: {e}", "WARN")
+                threading.Thread(target=_save_intraday, daemon=True).start()
+                _intraday_saved = True
+
             # 次日重置每日标志
             if now.hour == 9 and now.minute < 15:
-                _summary_sent = _scan_sent = _df_refreshed = False
+                _summary_sent = _scan_sent = _df_refreshed = _intraday_saved = False
 
             # 交易时段：逐用户轮询（各自隔离账户）
             if is_trading_time():

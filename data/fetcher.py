@@ -4,7 +4,9 @@
 """
 from __future__ import annotations
 
+import json
 import threading
+import urllib.request
 import datetime as _dt
 import pandas as pd
 from pathlib import Path
@@ -14,6 +16,52 @@ from mootdx.quotes import Quotes
 def _market(code: str) -> int:
     """深圳=0，上海=1（5开头的ETF如510300归上海）"""
     return 1 if code.startswith(("6", "9", "5")) else 0
+
+
+# ── 分钟K线（腾讯源）──────────────────────────────────────────
+# 直连 IP 的 mootdx 源只返回日线、不提供分钟数据，故分钟K改用腾讯接口。
+# 腾讯 mkline 返回近 ~320 根，约 7 个交易日，足够日内确认 + 向前积累历史。
+_TENCENT_FREQ = {"1m": "m1", "5m": "m5", "15m": "m15", "30m": "m30", "60m": "m60"}
+
+
+def fetch_minute(code: str, freq: str = "5m", count: int = 320) -> pd.DataFrame:
+    """
+    腾讯分钟K线。返回 DataFrame[datetime, open, high, low, close, vol]（按时间升序）。
+    失败返回空 DataFrame。
+    """
+    tfreq = _TENCENT_FREQ.get(freq)
+    if not tfreq:
+        return pd.DataFrame()
+    prefix = "sh" if code.startswith(("6", "9", "5")) else "sz"
+    symbol = f"{prefix}{code}"
+    url = (f"https://ifzq.gtimg.cn/appstock/app/kline/mkline"
+           f"?param={symbol},{tfreq},,{int(count)}")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        raw = urllib.request.urlopen(req, timeout=8).read().decode("utf-8")
+        node = json.loads(raw).get("data", {}).get(symbol, {})
+        bars = node.get(tfreq) or node.get("qfq" + tfreq) or []
+        rows = []
+        for b in bars:
+            # 腾讯格式：[时间YYYYMMDDHHMM, 开, 收, 高, 低, 量, ...]
+            if len(b) < 6:
+                continue
+            t = str(b[0])
+            dt = f"{t[0:4]}-{t[4:6]}-{t[6:8]} {t[8:10]}:{t[10:12]}:00"
+            rows.append({
+                "datetime": dt,
+                "open":  float(b[1]),
+                "close": float(b[2]),
+                "high":  float(b[3]),
+                "low":   float(b[4]),
+                "vol":   float(b[5]),
+            })
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)[["datetime", "open", "high", "low", "close", "vol"]]
+        return df.sort_values("datetime").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
 
 
 class KlineDB:

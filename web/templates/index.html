@@ -164,10 +164,12 @@ fetch('/api/me').then(r => r.json()).then(d => {
         <button class="filter-chip"        data-filter="sector" data-value="down" onclick="setSectorFilter(this)">⬇ 下降</button>
       </div>
       <div class="filter-row">
-        <span class="filter-label">RS排序</span>
-        <button class="filter-chip active" data-filter="sort" data-value="default" onclick="setSortFilter(this)">默认</button>
-        <button class="filter-chip"        data-filter="sort" data-value="rs_desc" onclick="setSortFilter(this)">高→低</button>
-        <button class="filter-chip"        data-filter="sort" data-value="rs_asc"  onclick="setSortFilter(this)">低→高</button>
+        <span class="filter-label">排序</span>
+        <button class="filter-chip active" data-filter="sort" data-value="default" onclick="setSortFilter(this)">默认(技术分)</button>
+        <button class="filter-chip"        data-filter="sort" data-value="ai_desc" onclick="setSortFilter(this)">🤖AI高→低</button>
+        <button class="filter-chip"        data-filter="sort" data-value="ai_asc"  onclick="setSortFilter(this)">🤖AI低→高</button>
+        <button class="filter-chip"        data-filter="sort" data-value="rs_desc" onclick="setSortFilter(this)">RS高→低</button>
+        <button class="filter-chip"        data-filter="sort" data-value="rs_asc"  onclick="setSortFilter(this)">RS低→高</button>
       </div>
     </div>
     <div class="text-muted small mb-2" id="scan-count"></div>
