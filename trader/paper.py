@@ -15,7 +15,36 @@ from pathlib import Path
 from typing import Optional
 
 
-DB_PATH = Path.home() / ".520quant" / "paper_trade.db"
+BASE_DIR  = Path.home() / ".520quant"
+LEGACY_DB = BASE_DIR / "paper_trade.db"        # 多用户化之前的单一账户库（迁移源）
+USERS_DIR = BASE_DIR / "users"                 # 各用户独立账户库目录
+MARKET_DB = BASE_DIR / "market.db"             # 全市场扫描结果（所有用户共享）
+
+# 向后兼容：旧代码引用的 DB_PATH
+DB_PATH = LEGACY_DB
+
+
+def user_db_path(user: str | None) -> Path:
+    """解析某用户的账户库路径；user 为空时回退到 legacy 单库（向后兼容）"""
+    if user:
+        return USERS_DIR / user / "paper_trade.db"
+    return LEGACY_DB
+
+
+def delete_user_data(user: str) -> bool:
+    """删除某用户的隔离数据目录（持仓/记录/自选/账户）。共享的 market.db 不受影响。"""
+    if not user:
+        return False
+    import shutil
+    user_dir = USERS_DIR / user
+    # 安全校验：确保目标确实在 USERS_DIR 之内，避免越界删除
+    try:
+        user_dir.resolve().relative_to(USERS_DIR.resolve())
+    except Exception:
+        return False
+    if user_dir.exists():
+        shutil.rmtree(user_dir, ignore_errors=True)
+    return True
 
 
 # ── 数据结构 ──────────────────────────────────────────────
@@ -35,12 +64,13 @@ class Order:
 
 @dataclass
 class PaperPosition:
-    code:       str
-    name:       str
-    cost:       float        # 均价
-    shares:     int
-    stop_price: float
-    entry_time: str
+    code:         str
+    name:         str
+    cost:         float        # 均价
+    shares:       int
+    stop_price:   float
+    entry_time:   str
+    entry_signal: str = ""     # 买入触发信号（信号类型 | 原因）
 
     def market_value(self, price: float) -> float:
         return price * self.shares
@@ -74,12 +104,13 @@ def _init_db(conn: sqlite3.Connection):
         );
 
         CREATE TABLE IF NOT EXISTS positions (
-            code        TEXT PRIMARY KEY,
-            name        TEXT,
-            cost        REAL,
-            shares      INTEGER,
-            stop_price  REAL,
-            entry_time  TEXT
+            code         TEXT PRIMARY KEY,
+            name         TEXT,
+            cost         REAL,
+            shares       INTEGER,
+            stop_price   REAL,
+            entry_time   TEXT,
+            entry_signal TEXT DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS watchlist (
@@ -131,6 +162,41 @@ def _init_db(conn: sqlite3.Connection):
     except Exception:
         pass   # 列已存在，忽略
 
+    # 迁移：positions 加 entry_signal 列（买入触发信号）
+    try:
+        conn.execute("ALTER TABLE positions ADD COLUMN entry_signal TEXT DEFAULT ''")
+        conn.commit()
+    except Exception:
+        pass   # 列已存在，忽略
+
+    # 迁移：scan_results 加 sector_name 列（申万行业名称，如"白酒Ⅱ"/"半导体"）
+    try:
+        conn.execute("ALTER TABLE scan_results ADD COLUMN sector_name TEXT DEFAULT ''")
+        conn.commit()
+    except Exception:
+        pass   # 列已存在，忽略
+
+    # 迁移：scan_results 加 score_detail 列（评分明细 JSON）
+    try:
+        conn.execute("ALTER TABLE scan_results ADD COLUMN score_detail TEXT DEFAULT '[]'")
+        conn.commit()
+    except Exception:
+        pass   # 列已存在，忽略
+
+    # 迁移：orders 加 conditions 列（交易条件追踪 JSON）
+    try:
+        conn.execute("ALTER TABLE orders ADD COLUMN conditions TEXT DEFAULT '[]'")
+        conn.commit()
+    except Exception:
+        pass
+
+    # 迁移：orders 加 voided 列（手动失效标记，1=失效不计入统计）
+    try:
+        conn.execute("ALTER TABLE orders ADD COLUMN voided INTEGER DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass   # 列已存在，忽略
+
     # 初始化账户资金（首次）
     cur = conn.execute("SELECT value FROM account WHERE key='cash'")
     if cur.fetchone() is None:
@@ -145,6 +211,38 @@ def _init_db(conn: sqlite3.Connection):
         conn.commit()
 
 
+# ── 共享扫描库（全市场扫描结果，所有用户共用 market.db）──────
+
+def _init_scan_db(conn: sqlite3.Connection):
+    """初始化共享扫描结果表"""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS scan_results (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_date    TEXT,
+            code         TEXT,
+            name         TEXT,
+            price        REAL,
+            signal       TEXT,
+            reason       TEXT,
+            score        REAL,
+            stop_price   REAL,
+            rs_score     REAL DEFAULT 0,
+            sector_dir   TEXT DEFAULT '',
+            cross_date   TEXT DEFAULT '',
+            sector_name  TEXT DEFAULT '',
+            score_detail TEXT DEFAULT '[]',
+            change_pct   REAL DEFAULT 0
+        );
+    """)
+    conn.commit()
+    # 迁移：老 market.db 可能没有 change_pct 列（当日涨跌幅）
+    try:
+        conn.execute("ALTER TABLE scan_results ADD COLUMN change_pct REAL DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass   # 列已存在，忽略
+
+
 # ── 模拟账户 ──────────────────────────────────────────────
 
 INIT_CAPITAL = 200_000.0    # 初始资金（可在启动时修改）
@@ -156,10 +254,19 @@ class PaperAccount:
     所有操作通过 SQLite 持久化，重启后恢复状态
     """
 
-    def __init__(self, init_capital: float = INIT_CAPITAL):
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    def __init__(self, init_capital: float = INIT_CAPITAL, user: str | None = None):
+        self.user = user
+
+        # ── 每用户独立账户库（account / positions / orders / watchlist）──
+        db_path = user_db_path(user)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         _init_db(self._conn)
+
+        # ── 共享扫描库（全市场扫描结果，所有用户共用）──
+        MARKET_DB.parent.mkdir(parents=True, exist_ok=True)
+        self._scan_conn = sqlite3.connect(str(MARKET_DB), check_same_thread=False)
+        _init_scan_db(self._scan_conn)
 
         # 首次运行设置初始资金
         cur = self._conn.execute("SELECT value FROM account WHERE key='cash'")
@@ -200,7 +307,8 @@ class PaperAccount:
         for r in rows:
             result[r[0]] = PaperPosition(
                 code=r[0], name=r[1], cost=r[2],
-                shares=r[3], stop_price=r[4], entry_time=r[5]
+                shares=r[3], stop_price=r[4], entry_time=r[5],
+                entry_signal=r[6] if len(r) > 6 else ""
             )
         return result
 
@@ -213,7 +321,8 @@ class PaperAccount:
             return None
         return PaperPosition(
             code=r[0], name=r[1], cost=r[2],
-            shares=r[3], stop_price=r[4], entry_time=r[5]
+            shares=r[3], stop_price=r[4], entry_time=r[5],
+            entry_signal=r[6] if len(r) > 6 else ""
         )
 
     def update_stop(self, code: str, new_stop: float) -> bool:
@@ -233,7 +342,9 @@ class PaperAccount:
     # ── 交易执行 ──────────────────────────────────────
 
     def buy(self, code: str, name: str, price: float, shares: int,
-            signal: str = "", stop_price: float = 0.0) -> tuple[bool, str]:
+            signal: str = "", stop_price: float = 0.0,
+            entry_signal: str = "",
+            conditions: list = None) -> tuple[bool, str]:
         """
         模拟买入
         返回 (成功, 消息)
@@ -262,18 +373,20 @@ class PaperAccount:
 
         # 写入订单
         self._conn.execute(
-            "INSERT INTO orders (code,name,side,price,shares,amount,signal,timestamp) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO orders (code,name,side,price,shares,amount,signal,timestamp,conditions) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (code, name, "BUY", price, shares, amount, signal,
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+             json.dumps(conditions or [], ensure_ascii=False))
         )
 
         # 写入持仓
         stop = stop_price or round(price * 0.95, 2)
         self._conn.execute(
-            "INSERT OR REPLACE INTO positions VALUES (?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO positions VALUES (?,?,?,?,?,?,?)",
             (code, name, price, shares, stop,
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+             entry_signal)
         )
 
         # 扣减现金
@@ -286,7 +399,8 @@ class PaperAccount:
         return True, msg
 
     def sell(self, code: str, price: float,
-             signal: str = "") -> tuple[bool, str]:
+             signal: str = "",
+             conditions: list = None) -> tuple[bool, str]:
         """
         模拟卖出（全仓）
         返回 (成功, 消息)
@@ -294,6 +408,11 @@ class PaperAccount:
         pos = self.get_position(code)
         if not pos:
             return False, f"无持仓: {code}"
+
+        # ── T+1 约束：当日买入不可当日卖出（A股规则）──
+        today = datetime.now().strftime("%Y-%m-%d")
+        if pos.entry_time and pos.entry_time[:10] == today:
+            return False, f"T+1限制：{code} 当日买入，不可当日卖出（{pos.entry_time[:10]}）"
 
         amount     = round(price * pos.shares, 2)
         commission = round(amount * 0.0003, 2)
@@ -305,10 +424,11 @@ class PaperAccount:
 
         # 写入订单
         self._conn.execute(
-            "INSERT INTO orders (code,name,side,price,shares,amount,signal,timestamp) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO orders (code,name,side,price,shares,amount,signal,timestamp,conditions) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (code, pos.name, "SELL", price, pos.shares, amount, signal,
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+             json.dumps(conditions or [], ensure_ascii=False))
         )
 
         # 删除持仓
@@ -464,6 +584,71 @@ class PaperAccount:
         print("=" * 45 + "\n")
 
 
+    # ── 交易失效管理 ─────────────────────────────────
+
+    def void_trade(self, sell_order_id: int, voided: bool = True) -> tuple[bool, str]:
+        """
+        将一笔已平仓交易标记为失效，同时回退现金影响。
+        sell_order_id: SELL 订单的 ID（api_trades 接口返回）
+        voided=True  → 失效：cash -= pnl（抹掉该笔盈亏）
+        voided=False → 恢复：cash += pnl（重新计入盈亏）
+        """
+        sell_row = self._conn.execute(
+            "SELECT code, side, amount, COALESCE(voided,0) FROM orders WHERE id=?",
+            (sell_order_id,)
+        ).fetchone()
+        if not sell_row:
+            return False, f"订单 {sell_order_id} 不存在"
+        code, side, sell_amount, already_voided = sell_row
+        if side != "SELL":
+            return False, "只能对卖出订单操作"
+        if bool(already_voided) == voided:
+            return True, "状态未变化，跳过"
+
+        # ── 找配对的买入订单（FIFO 匹配，与 api_trades 逻辑一致）──
+        all_orders = self._conn.execute(
+            "SELECT id, side, amount FROM orders WHERE code=? ORDER BY id",
+            (code,)
+        ).fetchall()
+
+        buy_queue   = []
+        paired_buy  = None
+        for oid, o_side, o_amount in all_orders:
+            if o_side == "BUY":
+                buy_queue.append((oid, o_amount))
+            elif o_side == "SELL" and buy_queue:
+                buy = buy_queue.pop(0)
+                if oid == sell_order_id:
+                    paired_buy = buy
+                    break
+
+        if not paired_buy:
+            return False, "找不到对应买入订单，无法调整现金"
+
+        _, buy_amount = paired_buy
+
+        # ── 计算该笔交易净盈亏（与 api_trades 公式一致）──
+        commission = round((buy_amount + sell_amount) * 0.0003, 2)
+        stamp_tax  = round(sell_amount * 0.001, 2)
+        pnl        = round(sell_amount - buy_amount - commission - stamp_tax, 2)
+
+        # ── 更新失效状态 ──
+        self._conn.execute(
+            "UPDATE orders SET voided=? WHERE id=?",
+            (1 if voided else 0, sell_order_id)
+        )
+
+        # ── 回退现金：失效→扣回盈亏；恢复→补回盈亏 ──
+        cash_delta = -pnl if voided else pnl
+        self._set("cash", self.cash + cash_delta)
+        self._conn.commit()
+
+        action = "失效" if voided else "恢复有效"
+        return True, (
+            f"{code} 已{action} | 现金调整 {cash_delta:+.2f} 元"
+            f"（该笔盈亏={pnl:+.2f} 元）"
+        )
+
     # ── Watchlist 管理 ────────────────────────────────
 
     def get_watchlist(self) -> list[dict]:
@@ -514,33 +699,39 @@ class PaperAccount:
     # ── 扫描结果 ──────────────────────────────────────
 
     def save_scan_results(self, scan_date: str, results: list[dict]):
-        """保存当日扫描结果（先清除旧记录）"""
-        self._conn.execute("DELETE FROM scan_results WHERE scan_date=?", (scan_date,))
+        """保存当日扫描结果到共享库（先清除当日所有旧记录，支持秒级时间戳）"""
+        date_prefix = scan_date[:10]   # 取 YYYY-MM-DD 前缀，清除同一天的历次扫描
+        self._scan_conn.execute("DELETE FROM scan_results WHERE scan_date LIKE ?", (date_prefix + "%",))
         for r in results:
-            self._conn.execute(
+            self._scan_conn.execute(
                 "INSERT INTO scan_results "
-                "(scan_date,code,name,price,signal,reason,score,stop_price,rs_score,sector_dir,cross_date) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "(scan_date,code,name,price,signal,reason,score,stop_price,"
+                "rs_score,sector_dir,cross_date,sector_name,score_detail,change_pct) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (scan_date, r["code"], r["name"], r["price"],
                  r["signal"], r["reason"],
                  r.get("score", 0), r.get("stop_price", 0),
                  r.get("rs_score", 0), r.get("sector_dir", ""),
-                 r.get("cross_date", ""))
+                 r.get("cross_date", ""), r.get("sector_name", ""),
+                 json.dumps(r.get("score_detail", []), ensure_ascii=False),
+                 r.get("change_pct", 0))
             )
-        self._conn.commit()
+        self._scan_conn.commit()
 
     def get_scan_results(self, scan_date: str = None) -> dict:
-        """获取扫描结果，默认取最新一天"""
+        """获取共享扫描结果，默认取最新一天"""
         if not scan_date:
-            row = self._conn.execute(
+            row = self._scan_conn.execute(
                 "SELECT scan_date FROM scan_results ORDER BY id DESC LIMIT 1"
             ).fetchone()
             if not row:
                 return {"date": "", "results": []}
             scan_date = row[0]
 
-        rows = self._conn.execute(
-            "SELECT code,name,price,signal,reason,score,stop_price,rs_score,sector_dir,cross_date "
+        rows = self._scan_conn.execute(
+            "SELECT code,name,price,signal,reason,score,stop_price,"
+            "rs_score,sector_dir,cross_date,sector_name,score_detail,"
+            "COALESCE(change_pct,0) "
             "FROM scan_results WHERE scan_date=? ORDER BY score DESC",
             (scan_date,)
         ).fetchall()
@@ -548,21 +739,37 @@ class PaperAccount:
             "date": scan_date,
             "results": [
                 {
-                    "code":       r[0],
-                    "name":       r[1],
-                    "price":      r[2],
-                    "signal":     r[3],
-                    "reason":     r[4],
-                    "score":      r[5],
-                    "stop_price": r[6],
-                    "rs_score":   r[7] if r[7] is not None else 0.0,
-                    "sector_dir": r[8] or "",
-                    "cross_date": r[9] or "",
+                    "code":         r[0],
+                    "name":         r[1],
+                    "price":        r[2],
+                    "signal":       r[3],
+                    "reason":       r[4],
+                    "score":        r[5],
+                    "stop_price":   r[6],
+                    "rs_score":     r[7] if r[7] is not None else 0.0,
+                    "sector_dir":   r[8] or "",
+                    "cross_date":   r[9] or "",
+                    "sector_name":  r[10] or "",
+                    "score_detail": json.loads(r[11]) if r[11] else [],
+                    "change_pct":   r[12] if r[12] is not None else 0.0,
                 }
                 for r in rows
             ]
         }
 
 
-# 全局单例（默认10万本金）
-paper = PaperAccount(init_capital=200_000)
+# 全局单例（懒加载）
+# 仅 scanner / 回测等批处理通过 `from trader.paper import paper` 使用，
+# 且只调用共享扫描方法（写 market.db）。改为懒加载后，单纯 import 本模块
+# （如 Web 服务）不会再创建遗留的 ~/.520quant/paper_trade.db。
+_paper_singleton: PaperAccount | None = None
+
+
+def __getattr__(name):
+    # PEP 562：首次访问 trader.paper.paper 时才实例化
+    global _paper_singleton
+    if name == "paper":
+        if _paper_singleton is None:
+            _paper_singleton = PaperAccount(init_capital=200_000)
+        return _paper_singleton
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

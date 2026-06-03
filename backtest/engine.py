@@ -165,6 +165,7 @@ class Backtester:
         trades               : list[Trade]     = []
         equity_log           : list[tuple]     = []
         market_blocked_days  : int             = 0    # 大盘过滤屏蔽建仓天数
+        day_close_prev       : dict[str, float] = {}  # 前一日收盘价（用于T+1开盘涨跌幅过滤）
 
         for date_str in sim_dates:
 
@@ -192,6 +193,21 @@ class Backtester:
                 if price <= 0:
                     # 当日无开盘价（停牌），推迟到下一交易日
                     continue
+
+                # 涨跌幅过滤：T+1开盘相对前收涨跌幅
+                prev_close = day_close_prev.get(code, 0)
+                if prev_close > 0:
+                    gap_pct = (price - prev_close) / prev_close * 100
+                    sig_type = pb.get("signal", "")
+                    is_breakout = "粘合" in sig_type
+                    is_pullback = "回踩" in sig_type
+                    if is_breakout and gap_pct >= 8.0:
+                        del pending_buys[code]; continue
+                    elif is_pullback and (gap_pct >= 5.0 or gap_pct <= -5.0):
+                        del pending_buys[code]; continue
+                    elif not is_breakout and not is_pullback and (gap_pct >= 8.0 or gap_pct <= -3.0):
+                        del pending_buys[code]; continue
+
                 shares = int(pos_size / price / 100) * 100
                 if shares < 100:
                     del pending_buys[code]
@@ -354,6 +370,9 @@ class Backtester:
                 for c, p in positions.items()
             )
             equity_log.append((date_str, round(cash + pos_val, 2)))
+
+            # 更新前收价（供下一日T+1涨跌幅过滤使用）
+            day_close_prev = dict(day_close)
 
         # ── 计算基准（沪深300 ETF）同期收益 ──
         benchmark_ret = 0.0
@@ -559,7 +578,8 @@ class Backtester:
                 pct  = (cur - pos["buy_price"]) / pos["buy_price"] * 100
                 flag = "🟢" if pct >= 0 else "🔴"
                 print(f"  {flag} {pos['name']}({code})  "
-                      f"信号{pos['signal_date']}  买入@{pos['buy_price']:.2f}  "
+                      f"信号{pos['signal_date']}  {pos['signal']}  "
+                      f"买入@{pos['buy_price']:.2f}  "
                       f"最新@{cur:.2f}  持有{pos['hold_days']}天  浮盈{pct:+.1f}%")
 
         print(f"\n{'='*65}\n")

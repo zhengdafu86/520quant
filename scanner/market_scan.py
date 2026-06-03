@@ -17,15 +17,45 @@
 from __future__ import annotations
 
 import time
+import json
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 from typing import Optional
 
 from data.fetcher import db
 from data.sector_map import get_sector_etf, get_sector_etf_by_industry
 from strategy.signal_520 import strategy, Signal
 from alert.notifier import log, _push, _date
+
+
+# ── 行业名持久化缓存（兜底：API 取不到行业时复用历史值）──────────────
+# 申万行业分类基本静态，缓存一次几乎不会过时；把"偶发 API 失败"变为非问题。
+_SECTOR_CACHE_PATH = Path.home() / ".520quant" / "sector_cache.json"
+
+
+def _load_industry_cache() -> dict[str, str]:
+    """加载 code→行业名 持久缓存"""
+    try:
+        if _SECTOR_CACHE_PATH.exists():
+            data = json.loads(_SECTOR_CACHE_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items() if v}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_industry_cache(cache: dict[str, str]):
+    """写回 code→行业名 持久缓存"""
+    try:
+        _SECTOR_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _SECTOR_CACHE_PATH.write_text(
+            json.dumps(cache, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception as e:
+        log(f"行业缓存写入失败（不影响扫描）: {e}", "WARN")
 
 
 # ── 基础过滤参数 ──────────────────────────────────────
@@ -279,6 +309,14 @@ class MarketScanner:
             ):
                 return None
 
+            # 当日涨跌幅（收盘 vs 昨收）
+            change_pct = 0.0
+            if len(df) >= 2:
+                prev_close = float(df.iloc[-2]["close"])
+                cur_close  = float(df.iloc[-1]["close"])
+                if prev_close > 0:
+                    change_pct = round((cur_close - prev_close) / prev_close * 100, 2)
+
             # 相对强度（RS）计算：个股20日涨幅 - 大盘20日涨幅
             rs_score = 0.0
             if len(df) >= 21:
@@ -288,16 +326,38 @@ class MarketScanner:
                     stock_20d_ret = (c_now - c_20d) / c_20d * 100
                     rs_score = round(stock_20d_ret - market_20d_ret, 2)
 
+            # RS 纳入主评分：强势股加分，弱势股扣分（不影响 rs_score 展示字段）
+            base_score = result.score or 0
+            rs_bonus = (
+                10 if rs_score >= 10 else
+                 5 if rs_score >=  3 else
+                -5 if rs_score <  -5 else
+                 0
+            )
+            final_score = min(100, max(0, base_score + rs_bonus))
+
+            # score_detail 追加 RS 加减分项（复制列表，不修改原 SignalResult）
+            score_detail = list(result.score_detail or [])
+            if rs_bonus != 0:
+                rs_label = (
+                    f"RS+{rs_score:.1f}%跑赢大盘" if rs_bonus > 0 else
+                    f"RS{rs_score:.1f}%跑输大盘"
+                )
+                score_detail.append((rs_bonus, rs_label))
+
             return {
                 "code":         code,
                 "name":         name,
                 "price":        price,
+                "change_pct":   change_pct,         # 当日涨跌幅%
                 "signal":       result.signal.value,
                 "reason":       result.reason,
-                "score":        result.score or 0,
+                "score":        final_score,
+                "score_detail": score_detail,       # 评分明细（含 RS）
                 "stop_price":   result.stop_price or round(price * 0.95, 2),
-                "rs_score":     rs_score,           # 相对强度分（正=跑赢大盘）
+                "rs_score":     rs_score,           # 相对强度分（正=跑赢大盘，仅展示）
                 "sector_dir":   sector_direction,   # 板块方向（仅展示参考）
+                "sector_name":  "",                 # 申万行业名（由 _enrich_sector_dir 填充）
                 "cross_date":   result.cross_date,  # 金叉形成日期
             }
         except Exception:
@@ -358,8 +418,9 @@ class MarketScanner:
                     results.append(r)
 
         # ── 东财单股 API 精确补充行业方向（仅对有信号的 ~20-50 只）──
-        # 比批量拉取全市场快得多：20只×5线程 ≈ 1s，且映射表已扩展到137条
+        # 并发扫描结束后稍作等待，避免请求高峰期东财 API 被截断
         if results:
+            time.sleep(2)
             log(f"东财 API 精确补充行业方向: {len(results)} 只...", "INFO")
             self._enrich_sector_dir(results, etf_dir_cache)
 
@@ -427,11 +488,51 @@ class MarketScanner:
     # ── 东财 API 行业补充 ────────────────────────────
 
     @staticmethod
+    def _fetch_industries_for_codes(codes: list[str]) -> dict[str, str]:
+        """
+        东财 ulist.np API，一次请求获取指定股票的申万行业（f100 字段）。
+        失败时最多重试 3 次（间隔 2s / 4s / 8s），应对扫描高峰期被截断的情况。
+        返回 {code(6位): industry_name}，如 {"600519": "白酒Ⅱ", ...}
+        """
+        import json as _json
+        if not codes:
+            return {}
+        secids = ",".join(
+            ("1" if c.startswith(("6", "9", "5")) else "0") + "." + c
+            for c in codes
+        )
+        url = (
+            "https://push2.eastmoney.com/api/qt/ulist.np/get"
+            f"?fltt=2&invt=2&secids={secids}&fields=f12,f100"
+        )
+        MAX_RETRY = 3
+        for attempt in range(MAX_RETRY + 1):
+            try:
+                req = urllib.request.Request(url)
+                req.add_header("User-Agent", "Mozilla/5.0")
+                raw   = urllib.request.urlopen(req, timeout=12).read().decode("utf-8")
+                items = (_json.loads(raw).get("data") or {}).get("diff") or []
+                result: dict[str, str] = {}
+                for item in items:
+                    code = str(item.get("f12") or "").zfill(6)
+                    ind  = str(item.get("f100") or "").strip()
+                    if code and ind and ind not in ("0", "-"):
+                        result[code] = ind
+                log(f"ulist行业查询: {len(result)}/{len(codes)} 只有行业数据", "INFO")
+                return result
+            except Exception as e:
+                if attempt < MAX_RETRY:
+                    wait = 2 ** (attempt + 1)   # 2s / 4s / 8s
+                    log(f"ulist行业查询第{attempt+1}次失败，{wait}s 后重试: {e}", "WARN")
+                    time.sleep(wait)
+                else:
+                    log(f"ulist行业查询彻底失败（{MAX_RETRY+1}次）: {e}", "WARN")
+        return {}
+
+    @staticmethod
     def _fetch_em_industry(code: str) -> str:
         """
-        东方财富 API 获取单只股票申万行业名称（f127 字段）。
-        返回如 "白酒Ⅱ" / "银行Ⅱ" / "半导体" / "乘用车" 等。
-        失败时返回空字符串。
+        单只股票申万行业名称（f127 字段）——仅作 ulist 批量失败时的兜底。
         """
         import json as _json
         prefix = "1" if code.startswith(("6", "9", "5")) else "0"
@@ -454,21 +555,46 @@ class MarketScanner:
         etf_dir_cache: dict[str, str],
     ):
         """
-        对有技术信号的股票，调用东财 API 精确获取申万行业，
-        再查对应 ETF 的 MA20 方向，覆盖写入 result["sector_dir"]。
-        并发请求（最多5线程）加速，保留限速间隔避免被封。
+        对有技术信号的股票，获取申万行业名称，再查对应 ETF MA20 方向。
+        策略：优先用 ulist 批量 API（f100，一次请求）；失败则逐只兜底。
         """
-        # 1. 并发获取行业（最多5线程，每线程请求间仍有间隔）
-        code_industry: dict[str, str] = {}
+        # 1. 批量获取行业（一次请求，比逐只 f127 稳定得多）
+        codes = [r["code"] for r in results]
+        code_industry: dict[str, str] = self._fetch_industries_for_codes(codes)
 
-        def _fetch_one(r: dict) -> tuple[str, str]:
-            time.sleep(0.05)   # 轻度限速
-            ind = self._fetch_em_industry(r["code"])
-            return r["code"], ind
+        # 逐只兜底：补充批量请求未返回的股票（理论上极少触发）
+        missing = [r for r in results if not code_industry.get(r["code"])]
+        if missing:
+            log(f"逐只兜底补充行业: {len(missing)} 只...", "INFO")
 
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            for code, ind in pool.map(_fetch_one, results):
-                code_industry[code] = ind
+            def _fetch_one(r: dict) -> tuple[str, str]:
+                time.sleep(0.05)
+                return r["code"], self._fetch_em_industry(r["code"])
+
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                for code, ind in pool.map(_fetch_one, missing):
+                    if ind:
+                        code_industry[code] = ind
+
+        # 1.5 持久化缓存兜底：API（批量+逐只）仍取不到的，复用历史成功值
+        persist_cache = _load_industry_cache()
+        from_cache = 0
+        for r in results:
+            code = r["code"]
+            if not code_industry.get(code) and persist_cache.get(code):
+                code_industry[code] = persist_cache[code]
+                from_cache += 1
+        if from_cache:
+            log(f"行业缓存兜底: {from_cache} 只复用历史行业名（本次 API 未返回）", "INFO")
+
+        # 把本次新取到的行业名并入缓存并持久化（供下次 API 失败时兜底）
+        updated = False
+        for code, ind in code_industry.items():
+            if ind and persist_cache.get(code) != ind:
+                persist_cache[code] = ind
+                updated = True
+        if updated:
+            _save_industry_cache(persist_cache)
 
         # 统计匹配情况
         matched   = 0
@@ -506,20 +632,23 @@ class MarketScanner:
                 icon = {"up": "⬆", "down": "⬇", "flat": "➡"}.get(direction, "❓")
                 log(f"  ETF {etf_code}: {direction} {icon}", "INFO")
 
-        # 3. 更新每只股票的 sector_dir（东财行业 > 名称关键词）
+        # 3. 更新每只股票的 sector_dir + sector_name（东财行业 > 名称关键词）
         for r in results:
             code = r["code"]
             ind  = code_industry.get(code, "")
             etf  = get_sector_etf_by_industry(ind) or get_sector_etf(r["name"])
             if etf:
                 r["sector_dir"] = etf_dir_cache.get(etf, "unknown")
+            # 无论是否有对应 ETF，只要东财返回了行业名就存下来
+            if ind:
+                r["sector_name"] = ind
 
     # ── 推送 + 存库 ─────────────────────────────────
 
     def notify_and_save(self, results: list[dict]):
         """推送企业微信 + 写入 scan_results 表（全部存库，只推送 Top N）"""
         from trader.paper import paper
-        scan_date = date.today().isoformat()
+        scan_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")   # 秒级时间戳，方便前端检测完成
         paper.save_scan_results(scan_date, results)   # 全量存库
 
         # 微信推送只取 Top N（避免消息过长）

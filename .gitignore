@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 临时 / 缓存
+.tmp_*/
+*.log
+.DS_Store
+
+# 本地数据与密钥（均在 ~/.520quant，仓库外；此处仅防误放）
+*.db
+.flask_secret
+sector_cache.json

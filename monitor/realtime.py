@@ -34,17 +34,25 @@ def is_market_open(now: datetime = None) -> bool:
            (dtime(13, 0)  <= t <= dtime(15, 0))
 
 
-def is_buy_window(now: datetime = None) -> bool:
+def is_buy_window(now: datetime = None, signal_type: str = "") -> bool:
     """
-    买入时间窗口：10:00-11:30 和 13:30-14:00
-    避开开盘30分钟（游资试盘）和尾盘（主力出货）
+    买入时间窗口（按信号类型差异化）：
+      粘合发散：9:45–11:30 / 13:00–14:30
+        突破信号时间敏感，9:45 已有 3 根 5 分钟 K 可确认方向
+      金叉 / 回踩：10:00–11:30 / 13:30–14:30
+        趋势确认信号，不追早盘博弈
+    统一排除 14:30 后（止盈执行窗口，不再新建仓）
     """
     now = now or datetime.now()
     if now.weekday() >= 5:
         return False
     t = now.time()
-    return (dtime(10, 0) <= t <= dtime(11, 30)) or \
-           (dtime(13, 30) <= t <= dtime(14, 0))
+    if "粘合" in signal_type or "发散" in signal_type:
+        return (dtime(9, 45) <= t <= dtime(11, 30)) or \
+               (dtime(13, 0)  <= t <= dtime(14, 30))
+    else:
+        return (dtime(10, 0) <= t <= dtime(11, 30)) or \
+               (dtime(13, 30) <= t <= dtime(14, 30))
 
 
 def is_profit_exit_window(now: datetime = None) -> bool:

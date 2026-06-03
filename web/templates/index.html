@@ -6,14 +6,50 @@
 <title>520量化监控</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
 <link rel="stylesheet" href="/static/style.css">
+<script>
+// 全局 fetch 拦截：会话过期(401)自动跳登录页，并始终携带 session cookie
+(function () {
+  const _fetch = window.fetch;
+  window.fetch = function (input, init) {
+    init = init || {};
+    if (!init.credentials) init.credentials = 'same-origin';
+    return _fetch(input, init).then(function (res) {
+      if (res.status === 401 &&
+          !String((input && input.url) || input).includes('/api/login')) {
+        window.location.href = '/login';
+      }
+      return res;
+    });
+  };
+  window.logout = function () {
+    fetch('/api/logout', { method: 'POST' }).finally(function () {
+      window.location.href = '/login';
+    });
+  };
+})();
+</script>
 </head>
 <body>
 
 <!-- 顶栏 -->
 <nav class="navbar navbar-dark bg-dark px-3 py-2 sticky-top">
   <span class="navbar-brand fw-bold">📈 520量化</span>
-  <span class="text-secondary small" id="refresh-time">--</span>
+  <span class="d-flex align-items-center gap-2">
+    <span class="text-secondary small" id="refresh-time">--</span>
+    <span class="text-light small" id="nav-user"></span>
+    <a href="/admin" id="admin-link" class="btn btn-sm btn-outline-warning py-0 px-2"
+       style="font-size:12px; display:none">⚙️ 用户管理</a>
+    <button class="btn btn-sm btn-outline-light py-0 px-2" style="font-size:12px"
+            onclick="logout()">登出</button>
+  </span>
 </nav>
+<script>
+// 顶栏显示当前登录用户名；管理员显示「用户管理」入口
+fetch('/api/me').then(r => r.json()).then(d => {
+  if (d && d.user) document.getElementById('nav-user').textContent = '👤 ' + d.user;
+  if (d && d.is_admin) document.getElementById('admin-link').style.display = '';
+}).catch(() => {});
+</script>
 
 <!-- 账户概览条 -->
 <div class="account-bar px-3 py-2" id="account-bar">
@@ -70,6 +106,29 @@
         <button class="btn btn-primary" onclick="addToWatchlist()">添加</button>
       </div>
     </div>
+
+    <!-- 过滤 / 排序栏 -->
+    <div class="filter-bar mb-2">
+      <div class="filter-row">
+        <span class="filter-label">信号</span>
+        <button class="filter-chip active" data-wfilter="signal" data-value="金叉" onclick="toggleWatchFilter(this)">✅ 金叉</button>
+        <button class="filter-chip active" data-wfilter="signal" data-value="回踩" onclick="toggleWatchFilter(this)">🔄 回踩</button>
+        <button class="filter-chip active" data-wfilter="signal" data-value="粘合" onclick="toggleWatchFilter(this)">🔀 粘合</button>
+      </div>
+      <div class="filter-row">
+        <span class="filter-label">评分</span>
+        <button class="filter-chip active" data-wfilter="sort" data-value="default"    onclick="setWatchSort(this)">默认</button>
+        <button class="filter-chip"        data-wfilter="sort" data-value="score_desc" onclick="setWatchSort(this)">高→低</button>
+        <button class="filter-chip"        data-wfilter="sort" data-value="score_asc"  onclick="setWatchSort(this)">低→高</button>
+      </div>
+      <div class="filter-row">
+        <span class="filter-label">买点</span>
+        <button class="filter-chip active" data-wfilter="status" data-value="all"        onclick="setWatchStatus(this)">全部</button>
+        <button class="filter-chip"        data-wfilter="status" data-value="has_signal" onclick="setWatchStatus(this)">有买点</button>
+        <button class="filter-chip"        data-wfilter="status" data-value="no_signal"  onclick="setWatchStatus(this)">已消失</button>
+      </div>
+    </div>
+    <div class="text-muted small mb-2" id="watch-count"></div>
     <div id="watchlist-list"></div>
   </div>
 
@@ -82,6 +141,16 @@
 
     <!-- 过滤 / 排序栏 -->
     <div class="filter-bar mb-2">
+      <div class="filter-row">
+        <span class="filter-label">精选</span>
+        <button class="filter-chip" data-filter="picks" onclick="toggleOnlyPicks(this)">🌟 只看精选 Top8</button>
+      </div>
+      <div class="filter-row">
+        <span class="filter-label">自选</span>
+        <button class="filter-chip active" data-filter="watch" data-value="all"        onclick="setScanWatchFilter(this)">全部</button>
+        <button class="filter-chip"        data-filter="watch" data-value="unselected" onclick="setScanWatchFilter(this)">未自选</button>
+        <button class="filter-chip"        data-filter="watch" data-value="selected"   onclick="setScanWatchFilter(this)">已自选</button>
+      </div>
       <div class="filter-row">
         <span class="filter-label">信号</span>
         <button class="filter-chip active" data-filter="signal" data-value="金叉" onclick="toggleScanFilter(this)">✅ 金叉</button>

@@ -17,11 +17,13 @@ import pandas as pd
 from data.fetcher import db
 from strategy.signal_520 import strategy, Signal
 
-# 各信号对应建仓比例（相对单只股票槽位 = 总资金 / max_positions）
+# 各信号仓位倍数（相对基准格 = 总资金 / max_positions）
+# 粘合发散最早期信号给满1.5格，金叉标准1格，回踩信心稍低给0.7格（可后续加仓）
+# 以 200K / 6 = 33K 基准格为例：粘合≈50K / 金叉≈33K / 回踩≈23K
 SIGNAL_SIZE = {
-    Signal.BUY_GOLDEN_CROSS: 0.30,   # 金叉：3成
-    Signal.BUY_PULLBACK:     0.20,   # 回踩：加2成
-    Signal.BUY_SQUEEZE:      0.50,   # 粘合：5成
+    Signal.BUY_GOLDEN_CROSS: 1.0,   # 金叉：1格（基准）
+    Signal.BUY_PULLBACK:     1.0,   # 回踩：1格（与金叉同等，信号最常见）
+    Signal.BUY_SQUEEZE:      1.5,   # 粘合：1.5格（重点仓位）
 }
 from monitor.realtime import get_quotes, is_trading_time, is_market_open
 from monitor.intraday import engine as intraday_engine, Action
@@ -35,14 +37,16 @@ from trader.paper import PaperAccount
 @dataclass
 class Position:
     """持仓记录"""
-    code:        str
-    name:        str
-    cost:        float
-    shares:      int
-    stop_price:  float
-    entry_time:  str   = ""
-    hold_days:   int   = 0
-    peak_pnl:    float = 0.0   # 历史最高盈利%，用于回落保护止盈
+    code:         str
+    name:         str
+    cost:         float
+    shares:       int
+    stop_price:   float
+    entry_time:   str   = ""
+    hold_days:    int   = 0
+    peak_pnl:           float = 0.0   # 历史最高盈利%，用于回落保护止盈
+    entry_signal:       str   = ""    # 买入触发信号（粘合/金叉/回踩），用于差异化止盈策略
+    first_limit_up_date: str  = ""    # 粘合发散：首次当日涨幅≥9%的日期（YYYY-MM-DD）；空=未出现过
 
     @property
     def market_value(self) -> float:
@@ -66,6 +70,7 @@ class WatchItem:
     signal:     str
     daily_df:   pd.DataFrame
     priority:   str = ""    # "P1" / "P2" / "P3"；空字符串 = 扫描器自动加入，排最后
+    score:      int = 0     # 信号评分（来自扫描结果），用于购买优先级排序
     added_time: str = ""
 
     def __post_init__(self):
@@ -77,23 +82,26 @@ class WatchItem:
 
 class MonitorEngine:
 
-    def __init__(self, interval: int = 30, paper_mode: bool = True):
+    def __init__(self, interval: int = 30, paper_mode: bool = True,
+                 user: str | None = None):
         self.interval       = interval      # 轮询间隔（秒）
         self.paper_mode     = paper_mode    # True=模拟交易 / False=实盘（需接券商）
-        self.max_positions  = 4             # 最多同时持仓4只
+        self.user           = user          # 该引擎服务的用户（数据隔离）
+        self.max_positions  = 6             # 最多同时持仓6只
         self.init_capital   = 200_000.0     # 总资金，用于计算每仓金额
         self.positions:  dict[str, Position]  = {}
         self.watchlist:  dict[str, WatchItem] = {}
         self._running    = False
         self._lock       = threading.Lock()
         self._broker     = None          # 可注入券商接口
-        self._paper      = PaperAccount() if paper_mode else None
+        self._paper      = PaperAccount(user=user) if paper_mode else None
         self._warn_cooldown: dict[str, float] = {}   # code -> 上次预警时间戳
 
     # ── 持仓管理 ──────────────────────────────────
 
     def add_position(self, code: str, cost: float, shares: int,
-                     name: str = "", stop_price: float = 0.0):
+                     name: str = "", stop_price: float = 0.0,
+                     entry_signal: str = ""):
         """手动添加持仓（或自动买入后调用）"""
         if not stop_price:
             daily_df  = db.get(code)
@@ -105,6 +113,7 @@ class MonitorEngine:
                 cost=cost, shares=shares,
                 stop_price=stop_price,
                 entry_time=datetime.now().strftime("%Y-%m-%d %H:%M"),
+                entry_signal=entry_signal,
             )
         log(f"持仓录入: {name}({code}) 成本={cost} 数量={shares} 止损={stop_price}", "INFO")
 
@@ -112,19 +121,50 @@ class MonitorEngine:
         with self._lock:
             self.positions.pop(code, None)
 
-    def add_watch(self, code: str, name: str, signal: str, priority: str = ""):
+    @staticmethod
+    def _is_bought_today(pos: "Position") -> bool:
+        """T+1：判断持仓是否为当日买入（当日买入不可当日卖出）"""
+        et = getattr(pos, "entry_time", "") or ""
+        return et[:10] == datetime.now().strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _risk_distance_pct(item: "WatchItem", price: float) -> float:
+        """
+        盈亏比代理——候选买入的"到止损距离%"，越小=止损越紧=风险越低=优先级越高。
+        止损参考（与各信号的技术止损一致）：
+          回踩 / 粘合发散 → MA20（跌破即破位）
+          金叉 / 默认     → MA5 × 0.97
+        无法计算或价格已在止损参考下方 → 返回大值，排到最后（check_entry 也会拦）。
+        """
+        if price <= 0 or item is None or getattr(item, "daily_df", None) is None:
+            return 9999.0
+        try:
+            last = item.daily_df.iloc[-1]
+            ma20 = float(last["ma20"])
+            ma5  = float(last["ma5"])
+        except Exception:
+            return 9999.0
+        sig = item.signal or ""
+        stop_ref = ma20 if ("粘合" in sig or "发散" in sig or "回踩" in sig) else ma5 * 0.97
+        if stop_ref <= 0 or stop_ref >= price:
+            return 9999.0
+        return (price - stop_ref) / price * 100.0
+
+    def add_watch(self, code: str, name: str, signal: str,
+                  priority: str = "", score: int = 0):
         """加入候选股监控
         priority: "P1" / "P2" / "P3"（手动 WATCHLIST 设置）；
                   空字符串 = 扫描器自动发现，排在所有手动股票之后
+        score:    信号评分（0-100），用于购买优先级排序（粘合发散优先，再按分数高低）
         """
         daily_df = db.get(code)
         with self._lock:
             self.watchlist[code] = WatchItem(
                 code=code, name=name, signal=signal,
-                daily_df=daily_df, priority=priority
+                daily_df=daily_df, priority=priority, score=score,
             )
         tag = priority if priority else "自动"
-        log(f"候选股加入: {name}({code}) 信号={signal} [{tag}]", "INFO")
+        log(f"候选股加入: {name}({code}) 信号={signal} 评分={score} [{tag}]", "INFO")
 
     def remove_watch(self, code: str):
         with self._lock:
@@ -147,10 +187,34 @@ class MonitorEngine:
                     shares=p.shares,
                     stop_price=p.stop_price,
                     entry_time=getattr(p, "entry_time", ""),
+                    entry_signal=getattr(p, "entry_signal", ""),
                 )
             log(f"加载持仓: {p.name}({code}) 成本={p.cost} "
                 f"止损={p.stop_price} {p.shares}股", "INFO")
         log(f"共加载 {len(paper_pos)} 只持仓", "INFO")
+
+    def load_watchlist_from_paper(self):
+        """从该用户自己的账户库加载自选股（评分取自共享扫描结果）。
+        已持仓的股票不重复加入候选。"""
+        if not (self.paper_mode and self._paper):
+            return
+        scan_data  = self._paper.get_scan_results()   # 共享 market.db
+        scan_score = {r["code"]: int(r.get("score") or 0)
+                      for r in (scan_data.get("results") or [])}
+        loaded = 0
+        for w in self._paper.get_watchlist():
+            code = w["code"]
+            if code in self.positions:
+                continue   # 已持仓，不再作为候选
+            self.add_watch(
+                code=code, name=w["name"],
+                signal=w.get("signal", "候选"),
+                priority=w.get("priority", ""),
+                score=scan_score.get(code, 0),
+            )
+            loaded += 1
+        if loaded:
+            log(f"[{self.user or '默认'}] 加载自选 {loaded} 只", "INFO")
 
     # ── 核心轮询 ──────────────────────────────────
 
@@ -205,14 +269,32 @@ class MonitorEngine:
                     )
                     pos = self.positions[code]   # 取最新引用
 
+            # 粘合发散：记录首次当日涨幅≥9%的日期
+            # 必须在 check_position 之前完成，使当日首涨停不触发锁利
+            if ("粘合" in pos.entry_signal or "发散" in pos.entry_signal):
+                chg_now = float(quote.get("change_pct", 0.0) or 0.0)
+                if chg_now >= 9.0 and not pos.first_limit_up_date:
+                    _today = datetime.now().strftime("%Y-%m-%d")
+                    with self._lock:
+                        if code in self.positions:
+                            self.positions[code].first_limit_up_date = _today
+                            pos = self.positions[code]
+                    log(f"📌 {pos.name}({code}) 粘合发散首涨停日={_today}，今日持有观察", "INFO")
+
             sig = intraday_engine.check_position(
                 code, daily_df, quote,
                 cost=pos.cost, stop_price=pos.stop_price,
-                peak_pnl=pos.peak_pnl,
+                peak_pnl=pos.peak_pnl, entry_signal=pos.entry_signal,
+                first_limit_up_date=pos.first_limit_up_date,
             )
 
             if sig.action in (Action.SELL_STOP, Action.SELL_PROFIT):
-                self._do_sell(pos, price, sig.reason)  # notify_sell 移至内部，仅成功才推送
+                if self._is_bought_today(pos):
+                    # T+1：当日买入不可当日卖，记录信号但不执行，次日交易日再处理
+                    log(f"{pos.name}({code}) 触发卖出信号但 T+1 锁定（当日买入），"
+                        f"明日再执行 | {sig.reason}", "INFO")
+                else:
+                    self._do_sell(pos, price, sig.reason, conditions=sig.conditions)  # notify_sell 移至内部，仅成功才推送
             else:
                 pnl = pos.pnl_pct(price)
                 if pos.stop_price and price > 0:
@@ -250,18 +332,34 @@ class MonitorEngine:
         except Exception as _e:
             log(f"大盘数据获取失败，默认允许建仓: {_e}", "WARN")
 
-        # P1 → P2 → P3 → 自动扫描（无优先级）
-        watch_codes_sorted = sorted(
-            watch_codes,
-            key=lambda c: _PRIORITY_KEY.get(
-                self.watchlist[c].priority if c in self.watchlist else "", 99
-            )
-        )
+        # 购买优先级：① 粘合发散优先（突破蓄势，信号最强）
+        #             ② 同类型内按【盈亏比】优先：到止损距离越小=止损越紧=风险越低，优先买
+        #             ③ 盈亏比相同时以 P1/P2/P3 手动优先级兜底，再以评分兜底
+        def _watch_sort_key(c: str):
+            item = self.watchlist.get(c)
+            if not item:
+                return (1, 9999.0, 99, 0)
+            is_squeeze = 0 if ("粘合" in item.signal or "发散" in item.signal) else 1
+            q     = quotes.get(c) or {}
+            price = q.get("price", 0) or 0
+            risk  = self._risk_distance_pct(item, price)   # 越小越优先
+            return (is_squeeze, risk,
+                    _PRIORITY_KEY.get(item.priority, 99), -item.score)
+
+        watch_codes_sorted = sorted(watch_codes, key=_watch_sort_key)
 
         if watch_codes_sorted:
+            top_items = [
+                f"{self.watchlist[c].name}({c})"
+                f"[{'粘合' if '粘合' in self.watchlist[c].signal else self.watchlist[c].signal[:2]}"
+                f" 止损距{self._risk_distance_pct(self.watchlist[c], (quotes.get(c) or {}).get('price', 0) or 0):.1f}%"
+                f" 分{self.watchlist[c].score}]"
+                for c in watch_codes_sorted if c in self.watchlist
+            ]
             log(f"候选股检查: 共{len(watch_codes_sorted)}只 | "
                 f"market_up={market_up} | hard_down={market_hard_down} | "
                 f"持仓{len(self.positions)}/{self.max_positions}", "INFO")
+            log(f"  检查顺序: {' → '.join(top_items)}", "INFO")
 
         for code in watch_codes_sorted:
             quote = quotes.get(code)
@@ -283,27 +381,33 @@ class MonitorEngine:
                 continue
 
             sig = intraday_engine.check_entry(code, item.daily_df, quote,
-                                              signal_type=item.signal)
+                                              signal_type=item.signal,
+                                              market_chg=mkt_chg)
 
             if sig.action == Action.BUY:
                 if len(self.positions) >= self.max_positions:
                     log(f"候选 {item.name}({code}) ⛔ 已达最大持仓{self.max_positions}只，跳过")
                     continue
                 price  = quote["price"]
-                shares = self._calc_shares(price)
-                self._do_buy(code, item.name, price, shares, sig.reason)
+                shares = self._calc_shares(price, signal_type=item.signal)
+                self._do_buy(code, item.name, price, shares, sig.reason,
+                            signal_type=item.signal, conditions=sig.conditions)
             else:
                 log(f"候选 {item.name}({code}) {quote['price']:.2f} | {sig.reason}")
 
     def _do_buy(self, code: str, name: str, price: float,
-                shares: int, reason: str):
+                shares: int, reason: str, signal_type: str = "",
+                conditions: list = None):
         """执行买入（可接券商API / 模拟账户）"""
         stop_price = round(price * 0.95, 2)
+        entry_signal = f"{signal_type} | {reason}" if signal_type else reason
 
         if self.paper_mode and self._paper:
             ok, msg = self._paper.buy(
                 code=code, name=name, price=price, shares=shares,
-                signal=reason, stop_price=stop_price
+                signal=reason, stop_price=stop_price,
+                entry_signal=entry_signal,
+                conditions=conditions,
             )
             if ok:
                 log(f"[模拟] {msg}", "BUY")
@@ -320,15 +424,16 @@ class MonitorEngine:
 
         self.add_position(
             code=code, cost=price, shares=shares, name=name,
-            stop_price=stop_price
+            stop_price=stop_price, entry_signal=entry_signal,
         )
         self.remove_watch(code)
 
-    def _do_sell(self, pos: Position, price: float, reason: str):
+    def _do_sell(self, pos: Position, price: float, reason: str, conditions: list = None):
         """执行卖出（可接券商API / 模拟账户）"""
         if self.paper_mode and self._paper:
             ok, msg = self._paper.sell(
-                code=pos.code, price=price, signal=reason
+                code=pos.code, price=price, signal=reason,
+                conditions=conditions,
             )
             if ok:
                 log(f"[模拟] {msg}", "SELL")
@@ -346,17 +451,30 @@ class MonitorEngine:
         notify_sell(pos.code, pos.name, price, pos.shares, pos.cost, reason)
         self.remove_position(pos.code)
 
-    def _calc_shares(self, price: float) -> int:
-        """满仓计算：总资金 ÷ 最大持仓数 = 单仓资金"""
-        slot_cap = self.init_capital / self.max_positions
+    def _calc_shares(self, price: float, signal_type: str = "") -> int:
+        """
+        差异化仓位计算：基准格 × 信号倍数
+        基准格 = 总资金 / max_positions
+        粘合发散 1.5格 / 金叉 1格 / 回踩 0.7格
+        """
+        base_slot = self.init_capital / self.max_positions
+        if "粘合" in signal_type or "发散" in signal_type:
+            mult = SIGNAL_SIZE[Signal.BUY_SQUEEZE]
+        elif "回踩" in signal_type:
+            mult = SIGNAL_SIZE[Signal.BUY_PULLBACK]
+        else:
+            mult = SIGNAL_SIZE[Signal.BUY_GOLDEN_CROSS]
+        slot_cap = base_slot * mult
         shares   = int(slot_cap / price / 100) * 100
         return max(100, shares)
 
     # ── 追踪止损 ──────────────────────────────────────
 
     # 关键档位：(最小浮盈%, 止损锁定描述, 止损倍数_相对成本)
+    # ≥10% 档实际取 max(成本×倍数, MA5×0.97)，趋势中跟随 MA5；下列为"保底地板"
     _TRAIL_TIERS = [
-        (20.0, "盈利超20%，锁定+10%保底",  1.10),
+        (30.0, "盈利超30%，锁定+20%保底",  1.20),
+        (20.0, "盈利超20%，锁定+13%保底",  1.13),
         (10.0, "盈利超10%，锁定+5%保底",   1.05),
         ( 5.0, "盈利超5%，止损移至保本",    1.002),  # 1.002 覆盖手续费
     ]
@@ -430,9 +548,9 @@ class MonitorEngine:
     def _crossed_key_level(old_stop: float, new_stop: float, cost: float) -> bool:
         """
         判断止损线是否跨越了关键里程碑，决定是否触发推送通知。
-        里程碑：成本价（保本）、成本×1.05（+5%）、成本×1.10（+10%）
+        里程碑：保本(×1.002)、+5%(×1.05)、+13%(×1.13)、+20%(×1.20)
         """
-        milestones = [cost * 1.002, cost * 1.05, cost * 1.10]
+        milestones = [cost * 1.002, cost * 1.05, cost * 1.13, cost * 1.20]
         for m in milestones:
             if old_stop < m <= new_stop:
                 return True
@@ -541,7 +659,10 @@ class MonitorEngine:
                     log(f"轮询异常: {e}", "ERR")
             else:
                 log("非交易时段，等待...")
-            time.sleep(self.interval)
+
+            # 14:30-15:00 止盈窗口加密轮询（15s），其余时段正常间隔（30s）
+            from monitor.realtime import is_profit_exit_window
+            time.sleep(15 if is_profit_exit_window() else self.interval)
 
     def start(self, background: bool = True):
         self._running = True
@@ -599,5 +720,146 @@ class MonitorEngine:
             self._paper.print_summary(current_prices)
 
 
-# 全局单例
-monitor = MonitorEngine(interval=30)
+# ── 多用户编排器 ──────────────────────────────────────
+# 单后台循环，逐用户在各自隔离账户上跑同一套策略；全市场扫描每日只跑一次（共享）。
+
+class MultiUserMonitor:
+    """
+    多用户监控编排器。
+    复用 MonitorEngine（每用户一个实例，交易逻辑原样不变），
+    本类只负责：构建各用户引擎、统一调度日级任务（刷日线/收盘汇总/扫描）、
+    每个 tick 逐用户调用 engine._tick()。
+    """
+
+    def __init__(self, interval: int = 30, paper_mode: bool = True):
+        self.interval   = interval
+        self.paper_mode = paper_mode
+        self.engines: dict[str, MonitorEngine] = {}
+        self._running   = False
+
+    def build(self):
+        """为每个注册用户构建引擎，加载各自持仓 + 自选。"""
+        from auth.users import list_users
+        users = [u["username"] for u in list_users()]
+        for user in users:
+            self.add_user(user, log_it=False)
+        log(f"多用户引擎构建完成：{len(self.engines)} 个用户"
+            f"（{', '.join(self.engines) or '无'}）", "INFO")
+        return self
+
+    def add_user(self, user: str, log_it: bool = True):
+        """纳入一个用户引擎（运行中也可动态加入，如管理员新建用户后）。"""
+        if user in self.engines:
+            return self.engines[user]
+        eng = MonitorEngine(interval=self.interval,
+                            paper_mode=self.paper_mode, user=user)
+        eng.load_from_paper()
+        eng.load_watchlist_from_paper()
+        self.engines[user] = eng
+        if log_it:
+            log(f"动态纳入用户引擎: {user}", "INFO")
+        return eng
+
+    def remove_user(self, user: str):
+        """移除一个用户引擎（如管理员删除用户后）。"""
+        self.engines.pop(user, None)
+
+    def _sync_users(self):
+        """与用户表对齐引擎名册：纳入新用户、移除已删用户。
+        监控进程与 Web 进程独立，靠每日同步让新建/删除的用户次日自动生效，
+        无需手动重启监控服务。"""
+        try:
+            from auth.users import list_users
+            current = {u["username"] for u in list_users()}
+        except Exception as e:
+            log(f"用户名册同步失败: {e}", "WARN")
+            return
+        for u in current - set(self.engines):
+            self.add_user(u)
+        for u in set(self.engines) - current:
+            self.remove_user(u)
+            log(f"移除已删用户引擎: {u}", "INFO")
+
+    def _loop(self):
+        log(f"多用户监控引擎启动 ✅（{len(self.engines)} 用户）")
+        _summary_sent = False
+        _scan_sent    = False
+        _df_refreshed = False
+        while self._running:
+            now = datetime.now()
+
+            # 09:15 同步用户名册 + 刷新各用户候选股日线（集合竞价前，每天一次）
+            if now.hour == 9 and now.minute >= 15 and not _df_refreshed:
+                self._sync_users()
+                for eng in list(self.engines.values()):
+                    try:
+                        eng._refresh_watchlist_daily_df()
+                    except Exception as e:
+                        log(f"刷新日线失败: {e}", "WARN")
+                _df_refreshed = True
+
+            # 15:30 各用户收盘汇总
+            if now.hour == 15 and now.minute == 30 and not _summary_sent:
+                for user, eng in list(self.engines.items()):
+                    try:
+                        eng.send_daily_summary()
+                    except Exception as e:
+                        log(f"[{user}] 收盘汇总失败: {e}", "WARN")
+                _summary_sent = True
+
+            # 15:35 全市场扫描（共享，只跑一次，不分用户）
+            if now.hour == 15 and now.minute == 35 and not _scan_sent:
+                from scanner.market_scan import scanner
+                threading.Thread(target=scanner.run, daemon=True).start()
+                _scan_sent = True
+
+            # 次日重置每日标志
+            if now.hour == 9 and now.minute < 15:
+                _summary_sent = _scan_sent = _df_refreshed = False
+
+            # 交易时段：逐用户轮询（各自隔离账户）
+            if is_trading_time():
+                for user, eng in list(self.engines.items()):
+                    try:
+                        eng._tick()
+                    except Exception as e:
+                        log(f"[{user}] 轮询异常: {e}", "ERR")
+            else:
+                log("非交易时段，等待...")
+
+            from monitor.realtime import is_profit_exit_window
+            time.sleep(15 if is_profit_exit_window() else self.interval)
+
+    def start(self, background: bool = True):
+        self._running = True
+        if background:
+            threading.Thread(target=self._loop, daemon=True).start()
+        else:
+            self._loop()
+
+    def stop(self):
+        self._running = False
+        log("多用户监控引擎已停止")
+
+    def status(self):
+        print("\n" + "=" * 60)
+        print(f"  520量化 多用户监控  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"  共 {len(self.engines)} 个用户")
+        print("=" * 60)
+        for user, eng in self.engines.items():
+            print(f"\n──────── 用户: {user} ────────")
+            eng.status()
+
+
+# 全局单例（懒加载，避免 import 即创建遗留库）
+_monitor_singleton: "MonitorEngine | None" = None
+
+
+def __getattr__(name):
+    # PEP 562：保留 `from monitor.engine import monitor` 的向后兼容（单用户引擎）
+    global _monitor_singleton
+    if name == "monitor":
+        if _monitor_singleton is None:
+            _monitor_singleton = MonitorEngine(interval=30)
+        return _monitor_singleton
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

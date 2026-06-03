@@ -18,6 +18,11 @@ import time
 # ── 模式开关 ────────────────────────────────────────────────
 PAPER_MODE = True        # True=模拟交易  False=实盘（需接券商API）
 
+# ── 命令行 / 后台引擎默认操作的用户 ──────────────────────────
+# 多用户化后，CLI 与后台自动交易引擎默认绑定主账号；
+# 其余用户通过 Web 登录后各自隔离操作。
+DEFAULT_USER = "zhengdafu86"
+
 # ── 持仓从 paper 账户自动读取，无需在此硬编码 ─────────────────
 # 使用 run.py --paper-buy <code> <price> <shares> 手动买入后会自动同步
 POSITIONS = []   # 保留字段以备手动临时注入，正常运行请留空
@@ -32,50 +37,39 @@ WATCHLIST = [
 
 
 def _build_monitor():
-    """构建监控引擎，持仓从 paper 账户同步"""
-    from monitor.engine import MonitorEngine
-    from trader.paper import PaperAccount
+    """
+    构建多用户监控编排器：为每个注册用户建一个引擎，
+    各自从自己的隔离账户加载持仓 + 自选；全市场扫描共享。
+    主账号额外注入 run.py 硬编码 WATCHLIST（保留原默认候选种子）。
+    """
+    from monitor.engine import MultiUserMonitor
 
-    monitor = MonitorEngine(interval=30, paper_mode=PAPER_MODE)
-    monitor.load_from_paper()
+    multi = MultiUserMonitor(interval=30, paper_mode=PAPER_MODE).build()
 
-    for p in POSITIONS:   # 通常为空，手动指定时才生效
-        monitor.add_position(
-            code=p["code"], name=p["name"],
-            cost=p["cost"], shares=p["shares"]
-        )
+    primary = multi.engines.get(DEFAULT_USER)
+    if primary is not None:
+        # 手动注入持仓（通常为空）
+        for p in POSITIONS:
+            if p["code"] not in primary.positions:
+                primary.add_position(
+                    code=p["code"], name=p["name"],
+                    cost=p["cost"], shares=p["shares"],
+                )
+        # 硬编码 WATCHLIST 作为主账号默认候选种子（优先级以此为准）
+        scan_score_map = {
+            r["code"]: int(r.get("score") or 0)
+            for r in (primary._paper.get_scan_results().get("results") or [])
+        }
+        for w in WATCHLIST:
+            if w["code"] in primary.positions:
+                continue
+            primary.add_watch(
+                code=w["code"], name=w["name"], signal=w["signal"],
+                priority=w.get("priority", ""),
+                score=scan_score_map.get(w["code"], 0),
+            )
 
-    paper        = PaperAccount()
-    db_watchlist = paper.get_watchlist()   # 网页自选股（含优先级）
-    db_pri_map   = {w["code"]: w.get("priority", "") for w in db_watchlist}
-
-    # ① 先加载 run.py 里硬编码的 WATCHLIST（优先级以此为准）
-    loaded_codes: set[str] = set()
-    for w in WATCHLIST:
-        priority = w.get("priority") or db_pri_map.get(w["code"], "")
-        monitor.add_watch(
-            code=w["code"], name=w["name"], signal=w["signal"],
-            priority=priority
-        )
-        loaded_codes.add(w["code"])
-
-    # ② 加载网页 DB 自选股（尚未在 ① 里的 + 尚未持仓的）
-    # 这是自动买入的主要来源：用户在页面扫描后点「+ 自选」的股票
-    for w in db_watchlist:
-        code = w["code"]
-        if code in loaded_codes:
-            continue                           # 已在 ① 里
-        if code in monitor.positions:
-            continue                           # 已在持仓，不重复加
-        monitor.add_watch(
-            code=code,
-            name=w["name"],
-            signal=w.get("signal", "候选"),
-            priority=w.get("priority", ""),
-        )
-        loaded_codes.add(code)
-
-    return monitor
+    return multi
 
 
 def run_monitor():
@@ -157,7 +151,7 @@ def run_status():
 def run_report():
     """打印模拟账户绩效报告"""
     from trader.paper import PaperAccount
-    paper = PaperAccount()
+    paper = PaperAccount(user=DEFAULT_USER)
     paper.print_performance()
     paper.print_summary()
 
@@ -178,7 +172,7 @@ def run_paper_buy(code: str, price: float, shares: int):
     except Exception:
         name = code
 
-    paper = PaperAccount()
+    paper = PaperAccount(user=DEFAULT_USER)
     ok, msg = paper.buy(code, name, price, shares, signal="手动买入")
     print(f"{'✅' if ok else '❌'} {msg}")
     if ok:
@@ -188,7 +182,7 @@ def run_paper_buy(code: str, price: float, shares: int):
 def run_paper_sell(code: str, price: float):
     """手动模拟卖出"""
     from trader.paper import PaperAccount
-    paper = PaperAccount()
+    paper = PaperAccount(user=DEFAULT_USER)
     ok, msg = paper.sell(code, price, signal="手动卖出")
     print(f"{'✅' if ok else '❌'} {msg}")
     if ok:
@@ -206,7 +200,7 @@ def run_backtest(start_date: str = "", end_date: str = ""):
     from backtest.engine import Backtester
 
     # 股票池：paper DB 自选 + run.py WATCHLIST 合并去重
-    paper    = PaperAccount()
+    paper    = PaperAccount(user=DEFAULT_USER)
     db_watch = paper.get_watchlist()
     extra    = [{"code": w["code"], "name": w["name"]} for w in WATCHLIST]
     seen     = set()
@@ -237,7 +231,7 @@ def run_backtest(start_date: str = "", end_date: str = ""):
 def run_reset_paper():
     """重置模拟账户（危险操作，需二次确认）"""
     from pathlib import Path
-    db_path = Path.home() / ".520quant" / "paper_trade.db"
+    db_path = Path.home() / ".520quant" / "users" / DEFAULT_USER / "paper_trade.db"
     confirm = input(f"确认删除模拟账户数据？({db_path}) [y/N]: ").strip().lower()
     if confirm == "y":
         if db_path.exists():
