@@ -34,6 +34,14 @@ from alert.notifier import log, _push, _date
 # 申万行业分类基本静态，缓存一次几乎不会过时；把"偶发 API 失败"变为非问题。
 _SECTOR_CACHE_PATH = Path.home() / ".520quant" / "sector_cache.json"
 
+# ── 高股息防御板块过滤 ───────────────────────────────────
+# 回踩是动量策略，最吃"会趋势运动"的票；电力/高速/燃气这类防御红利股区间震荡、
+# 回踩信号质量天然低。全样本+多窗口回测验证：剔除后全期收益 28%→34%、卡玛 5.25→6.68。
+# 按行业经济属性定义(非挑表现差的)，降低过拟合；可配开关，默认开。
+FILTER_DEFENSIVE_SECTORS = True
+DEFENSIVE_SECTORS = {"电力", "铁路公路", "燃气Ⅱ", "燃气", "公用事业",
+                     "港口", "水务", "高速公路", "供气供热", "航运港口", "电力Ⅱ"}
+
 
 def _load_industry_cache() -> dict[str, str]:
     """加载 code→行业名 持久缓存"""
@@ -432,6 +440,14 @@ class MarketScanner:
             log(f"东财 API 精确补充行业方向: {len(results)} 只...", "INFO")
             self._enrich_sector_dir(results, etf_dir_cache)
 
+        # ── 剔除高股息防御板块（电力/高速/燃气等区间震荡股；回测验证剔除更优）──
+        if FILTER_DEFENSIVE_SECTORS and results:
+            _before = len(results)
+            results = [r for r in results if r.get("sector_name", "") not in DEFENSIVE_SECTORS]
+            if _before != len(results):
+                log(f"防御板块过滤: 剔除 {_before - len(results)} 只"
+                    f"(电力/高速/燃气等低弹性红利股)", "INFO")
+
         # 双维排序：信号强度（score）→ 相对强度（rs_score），均降序
         results.sort(key=lambda x: (x["score"], x.get("rs_score", 0)), reverse=True)
 
@@ -658,6 +674,19 @@ class MarketScanner:
         from trader.paper import paper
         scan_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")   # 秒级时间戳，方便前端检测完成
         paper.save_scan_results(scan_date, results)   # 全量存库
+
+        # ── 资金流采集（低频单波，绕开东财突发限流）──────────────
+        # 扫描存库后只发这一波 _fund_batch（clist 大页约6请求），把候选当日/5日/10日
+        # 主力净额存进库，供 AI 评分参考。失败不影响扫描主流程。
+        try:
+            from scanner.ai_score import _fund_batch
+            codes = [r["code"] for r in results]
+            if codes:
+                fund = _fund_batch(codes)
+                hit = paper.update_fund_flow(fund, scan_date)
+                log(f"资金流采集：命中 {hit}/{len(codes)} 只入库", "INFO")
+        except Exception as e:
+            log(f"资金流采集失败（不影响扫描）：{e}", "WARN")
 
         # 微信推送只取 Top N（避免消息过长）
         notify_top = results[:SCAN_MAX_RESULTS]

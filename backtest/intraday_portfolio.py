@@ -25,6 +25,8 @@ import sys
 import bisect
 import argparse
 import statistics
+import hashlib
+import pickle
 from datetime import datetime
 from pathlib import Path
 
@@ -83,14 +85,16 @@ def _sig_mult(sig: str) -> float:
     return SIGNAL_SIZE[Signal.BUY_GOLDEN_CROSS]
 
 
-def _update_stop(pos: dict, price: float, ma5: float):
-    """复刻 engine._update_trailing_stops：止损线只升不降"""
+def _update_stop(pos: dict, price: float, ma5: float, tiers=None, ma5_min: float = 10.0):
+    """复刻 engine._update_trailing_stops：止损线只升不降。
+    tiers: 自定义分档(默认现行 TIERS)；ma5_min: 达此浮盈档起，止损还与 MA5×0.97 取高。"""
+    tiers = tiers if tiers is not None else TIERS
     gain = (price - pos["cost"]) / pos["cost"] * 100
     cand = pos["stop"]
-    for min_gain, _label, mult in TIERS:
+    for min_gain, _label, mult in tiers:
         if gain >= min_gain:
             base = pos["cost"] * mult
-            cand = max(base, round(ma5 * 0.97, 2)) if (min_gain >= 10 and ma5 > 0) else base
+            cand = max(base, round(ma5 * 0.97, 2)) if (min_gain >= ma5_min and ma5 > 0) else base
             break
     if cand > pos["stop"]:
         pos["stop"] = round(cand, 2)
@@ -125,7 +129,64 @@ def _precompute_candidates(daily: pd.DataFrame) -> dict:
     return out
 
 
+_CACHE_DIR = Path.home() / ".520quant" / "bt_cache"
+
+
+def _ctx_cache_key(codes) -> str:
+    """缓存键：股票池 + DB版本 + signal_520/fetcher内容哈希 + 候选相关flag。
+    任一变化 → 键变 → 自动重算（杜绝陈旧候选）。"""
+    import os
+    import strategy.signal_520 as s
+    root = Path(__file__).parent.parent
+    db_file = Path.home() / ".520quant" / "intraday.db"
+    try:
+        st = db_file.stat(); dbsig = f"{st.st_mtime_ns}-{st.st_size}"
+    except Exception:
+        dbsig = "nodb"
+    def _h(p):
+        try:
+            return hashlib.md5((root / p).read_bytes()).hexdigest()[:10]
+        except Exception:
+            return "x"
+    flags = (getattr(s, "MULTIDAY_SHRINK", None), getattr(s, "MULTIDAY_SHRINK_RATIO", None),
+             getattr(s, "MULTIDAY_SHRINK_BONUS", None), getattr(s, "SCORE_MAX", None),
+             getattr(s, "UPSIDE_ROOM_FILTER", None), getattr(s, "UPSIDE_LOOKBACK", None),
+             getattr(s, "UPSIDE_MIN_ROOM", None))
+    raw = (f"{len(codes)}|{'|'.join(sorted(codes))}|{dbsig}|"
+           f"sig{_h('strategy/signal_520.py')}|fet{_h('data/fetcher.py')}|{flags}")
+    return hashlib.md5(raw.encode()).hexdigest()[:16]
+
+
 def load_ctx(codes):
+    """带缓存：键不变则秒级读盘，跳过~10分钟的加载+候选预计算。
+    环境变量 BT_NO_CACHE=1 可强制重算。"""
+    import os
+    if not os.environ.get("BT_NO_CACHE"):
+        try:
+            _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            f = _CACHE_DIR / f"ctx_{_ctx_cache_key(codes)}.pkl"
+            if f.exists():
+                with open(f, "rb") as fh:
+                    ctx = pickle.load(fh)
+                print(f"[ctx缓存命中] {f.name}（跳过加载，秒级）")
+                return ctx
+        except Exception as e:
+            print(f"[ctx缓存读取跳过] {e}")
+            f = None
+    else:
+        f = None
+    ctx = _load_ctx_compute(codes)
+    if f is not None:
+        try:
+            with open(f, "wb") as fh:
+                pickle.dump(ctx, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f"[ctx已缓存] {f.name}（下次秒级读取）")
+        except Exception as e:
+            print(f"[ctx缓存写入失败] {e}")
+    return ctx
+
+
+def _load_ctx_compute(codes):
     """一次性加载：日线 + 5分钟 + 候选 + 各日全天量。返回 ctx 供多次 simulate 复用。"""
     daily_map, m5_map, cand_map, day_total, sdates = {}, {}, {}, {}, {}
     for c in codes:
@@ -144,7 +205,8 @@ def load_ctx(codes):
 
 
 def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
-             top_n=8, atr_mult=0.0, scale_pct=0.0):
+             top_n=8, atr_mult=0.0, scale_pct=0.0, priority="squeeze_risk",
+             tiers=None, ma5_min=10.0, stop_on_low=False, tail_entry=False):
     """在 ctx 上跑一次忠实回测（使用 intraday 模块当前的止损/止盈参数）。
     top_n: 每日"精选"上限——只在评分最高的 top_n 只信号股里建仓（0=不设上限）。
     返回 (trades, equity_curve, positions)。"""
@@ -159,6 +221,33 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
         if px <= 0 or stop_ref <= 0 or stop_ref >= px:
             return 9999.0
         return (px - stop_ref) / px * 100
+
+    def _multiday_shrink(code, asof, ratio: float = 0.8):
+        """近3日均量 ≤ 近20日均量×ratio（截至信号日 asof-1）→ 多日持续缩量。"""
+        v = daily_map[code]["vol"].iloc[:asof].astype(float)
+        if len(v) < 20:
+            return False
+        a20 = v.tail(20).mean()
+        return a20 > 0 and v.tail(3).mean() <= a20 * ratio
+
+    # 市场20日收益（按日期）→ 用于 RS 相对强度
+    _mk = ctx["mk"]
+    _mk_close = _mk["close"].astype(float).tolist()
+    _mk_d = _mk["d"].tolist()
+    _mk_ret20 = {}
+    for _i in range(20, len(_mk_d)):
+        if _mk_close[_i - 20] > 0:
+            _mk_ret20[_mk_d[_i]] = _mk_close[_i] / _mk_close[_i - 20] - 1
+
+    def _rs(code, asof):
+        """相对强度 = 个股近20日收益 − 沪深300同期收益（截至信号日 asof-1）。越大越强。"""
+        d = daily_map[code]
+        if asof < 21:
+            return -9.9
+        c_now = float(d.iloc[asof - 1]["close"]); c_20 = float(d.iloc[asof - 21]["close"])
+        if c_20 <= 0:
+            return -9.9
+        return (c_now / c_20 - 1) - _mk_ret20.get(str(d.iloc[asof - 1]["d"]), 0.0)
 
     def vol_ratio(code, T, i, day):
         elapsed = _elapsed_min(day[i][0])
@@ -188,6 +277,18 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
         sub = d[d["d"] < date_t]
         return sub if len(sub) >= 25 else None
 
+    # 尾盘建仓模式：把候选改按"信号日"索引（信号日收盘形成信号 → 当日尾盘买）
+    cand_tail = {}
+    if tail_entry:
+        for c, cm in cand_map.items():
+            d = daily_map[c]
+            sd_map = {}
+            for T_act, (sig, asof, score) in cm.items():
+                if asof - 1 < len(d):
+                    sd = str(d.iloc[asof - 1]["d"])   # 信号形成日
+                    sd_map[sd] = (sig, asof, score)
+            cand_tail[c] = sd_map
+
     all_dates = set()
     for c in m5_map:
         all_dates |= set(m5_map[c].keys())
@@ -204,17 +305,34 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
         mkt_ok = market_up(T)
         # 当日候选（粘合优先，再评分降序——评分用 analyze 复算一次）
         todays = []
+        _src = cand_tail if tail_entry else cand_map
         for c in daily_map:
-            if T in cand_map[c]:
-                sig, asof, score = cand_map[c][T]
+            cm = _src.get(c) if tail_entry else cand_map[c]
+            if cm and T in cm:
+                sig, asof, score = cm[T]
                 todays.append((c, sig, asof, score))
         # A: 精选 Top-N —— 按评分降序只保留前 top_n 只（复刻实盘"只买精选"）
         if top_n and top_n > 0 and len(todays) > top_n:
             todays.sort(key=lambda it: -it[3])
             todays = todays[:top_n]
-        # B: 买入优先级 —— 粘合优先 → 盈亏比(到止损距离)升序（与实盘一致）
-        todays.sort(key=lambda it: (0 if ("粘合" in it[1] or "发散" in it[1]) else 1,
-                                    _risk_dist(it[0], it[1], it[2])))
+        # B: 买入优先级
+        if priority == "score":
+            # 按评分降序优先买（评分高者先建仓）
+            todays.sort(key=lambda it: -it[3])
+        elif priority == "shrink":
+            # 多日持续缩量优先（独立条件，隔离其影响）→ 再粘合 → 再盈亏比
+            todays.sort(key=lambda it: (0 if _multiday_shrink(it[0], it[2]) else 1,
+                                        0 if ("粘合" in it[1] or "发散" in it[1]) else 1,
+                                        _risk_dist(it[0], it[1], it[2])))
+        elif priority == "rs":
+            # 粘合首位 → RS(相对强度)高优先 → 盈亏比（粘合仍最优先，RS作次级排序）
+            todays.sort(key=lambda it: (0 if ("粘合" in it[1] or "发散" in it[1]) else 1,
+                                        -_rs(it[0], it[2]),
+                                        _risk_dist(it[0], it[1], it[2])))
+        else:
+            # 默认：粘合优先 → 盈亏比(到止损距离)升序
+            todays.sort(key=lambda it: (0 if ("粘合" in it[1] or "发散" in it[1]) else 1,
+                                        _risk_dist(it[0], it[1], it[2])))
 
         for i in range(48):
             # ── 出场（先于进场，释放仓位）──
@@ -238,7 +356,7 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
                 pos["peak"] = max(pos["peak"], pnl)
                 if ("粘合" in pos["sig"] or "发散" in pos["sig"]) and chg >= 9.0 and not pos["flu"]:
                     pos["flu"] = T
-                _update_stop(pos, price, ma5)
+                _update_stop(pos, price, ma5, tiers=tiers, ma5_min=ma5_min)
                 runhigh = max(float(day[j][2]) for j in range(i + 1))
                 runlow  = min(float(day[j][3]) for j in range(i + 1))
                 _CTX["dt"] = ts
@@ -249,9 +367,10 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
                 hd = date_idx.get(T, 0) - date_idx.get(pos["entry_date"], 0)
                 pos["peak_price"] = max(pos.get("peak_price", price), price)
 
-                def _sell(qty, exit_name):
+                def _sell(qty, exit_name, at_price=None):
                     nonlocal cash
-                    exec_p = round(price * (1 - slippage), 3)
+                    base = at_price if at_price is not None else price
+                    exec_p = round(base * (1 - slippage), 3)
                     gross = exec_p * qty
                     fee = round(gross * (COMMISSION + STAMP_TAX), 2)
                     net = gross - fee
@@ -263,6 +382,15 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
                                    "pnl": round(net - cost_amt, 2),
                                    "pnl_pct": round((net - cost_amt) / cost_amt * 100, 2),
                                    "sig": pos["sig"], "exit": exit_name})
+
+                # 盘中最低价口径：本根高点棘轮抬止损，低点触及即按止损价成交
+                # （贴近实盘10秒轮询的瞬时触发，能捕捉"涨5%后回踩到成本被震出"）
+                if stop_on_low:
+                    _update_stop(pos, float(bar[2]), ma5, tiers=tiers, ma5_min=ma5_min)
+                    if float(bar[3]) < pos["stop"]:
+                        _sell(pos["shares"], "SELL_STOP_LOW", at_price=pos["stop"])
+                        del positions[code]
+                        continue
 
                 # 分批止盈：达到 scale_pct 先卖一半，剩余继续按规则跑
                 if scale_pct > 0 and not pos["scaled"] and pnl >= scale_pct:
@@ -289,8 +417,8 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
                     if take:
                         _sell(pos["shares"], sig.action.name); del positions[code]
 
-            # ── 进场 ──
-            if mkt_ok:
+            # ── 进场 ──（尾盘模式跳过盘中进场，改在日终统一尾盘买）
+            if mkt_ok and not tail_entry:
                 for code, stype, asof, _score in todays:
                     if code in positions or len(positions) >= max_pos:
                         continue
@@ -328,6 +456,32 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
                                            "sig": stype, "entry_date": T, "flu": "",
                                            "atr": _atr(sub), "peak_price": exec_p,
                                            "scaled": False}
+
+        # ── 尾盘建仓：信号日收盘形成信号 → 当日最后一根5分钟K(尾盘)买入 ──
+        # （避开次日跳空买不进；信号已在收盘成立，直接按收盘价建仓）
+        if tail_entry and mkt_ok:
+            for code, stype, asof, _score in todays:
+                if code in positions or len(positions) >= max_pos:
+                    continue
+                day = m5_map[code].get(T)
+                if not day:
+                    continue
+                price = float(day[-1][4])           # 当日尾盘收盘价
+                exec_p = round(price * (1 + slippage), 3)
+                slot = grid * _sig_mult(stype)
+                shares = int(slot / exec_p / 100) * 100
+                if shares < 100:
+                    continue
+                amt = exec_p * shares
+                fee = round(amt * COMMISSION, 2)
+                if cash < amt + fee:
+                    continue
+                cash -= amt + fee
+                sub = daily_map[code].iloc[:asof]
+                positions[code] = {"cost": exec_p, "shares": shares,
+                                   "stop": round(exec_p * 0.95, 2), "peak": 0.0,
+                                   "sig": stype, "entry_date": T, "flu": "",
+                                   "atr": _atr(sub), "peak_price": exec_p, "scaled": False}
 
         # 当日收盘市值（按各股当日最后一根5分钟收盘）
         pv = 0.0

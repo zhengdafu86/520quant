@@ -387,12 +387,15 @@ function _renderWatchCards(list) {
          </div>`
       : '';
 
+    const heldBadge = w.held ? `<span class="held-badge">💼 已持仓</span>` : '';
+
     return `
-    <div class="stock-card ${hasScan ? 'card-has-signal' : ''}">
+    <div class="stock-card ${hasScan ? 'card-has-signal' : ''}${w.held ? ' card-held' : ''}">
       <div class="d-flex justify-content-between align-items-start">
         <div>
           <span class="code-name">${w.name}</span>
           <span class="code-tag">${w.code}</span>
+          ${heldBadge}
           ${scanBadge}
           ${noSignalHtml}
         </div>
@@ -633,6 +636,7 @@ function _renderScanCards(list) {
     // 精选标记（质量分 Top-N，仓位有限时优先考虑）
     const isPick   = _scanPickSet.has(r.code);
     const pickBadge = isPick ? `<span class="pick-badge">🌟 精选</span>` : '';
+    const heldBadge = r.held ? `<span class="held-badge">💼 已持仓</span>` : '';
 
     // AI 综合评分（技术+资金+消息，仅展示参考）
     const aiScore = r.ai_score || 0;
@@ -649,12 +653,13 @@ function _renderScanCards(list) {
     const chgHtml = `<span class="${chgCls}" style="font-size:13px;font-weight:600">${chgStr}</span>`;
 
     return `
-    <div class="stock-card${isPick ? ' card-pick' : ''}">
+    <div class="stock-card${isPick ? ' card-pick' : ''}${r.held ? ' card-held' : ''}">
       <div class="d-flex justify-content-between align-items-start">
         <div>
           <span class="rank-num">#${i + 1}</span>
           <span class="code-name">${r.name}</span>
           <span class="code-tag">${r.code}</span>
+          ${heldBadge}
         </div>
         <div class="d-flex align-items-center gap-2">
           <span class="price">${r.price.toFixed(2)}</span>
@@ -687,7 +692,23 @@ function _esc(s) {
 }
 
 /* ── 扫描结果 ────────────────────────────────── */
+async function loadHotThemes() {
+  const cont = document.getElementById('hot-panel');
+  if (!cont) return;
+  try {
+    const d = await fetch('/api/hot').then(r => r.json());
+    const themes = d.themes || [];
+    if (!themes.length) { cont.innerHTML = ''; return; }
+    const chips = themes.map(t =>
+      `<span class="hot-chip" title="${(t.stocks||[]).slice(0,8).join(' / ')}">`
+      + `${_esc(t.theme)}<b>${t.stock_count}</b></span>`).join('');
+    cont.innerHTML = `<div class="hot-title">🔥 今日热点题材 <span class="text-muted">`
+      + `${d.date||''}</span></div><div class="hot-chips">${chips}</div>`;
+  } catch (e) { cont.innerHTML = ''; }
+}
+
 async function loadScan() {
+  loadHotThemes();
   const [data, wlist] = await Promise.all([
     fetch('/api/scan').then(r => r.json()),
     fetch('/api/watchlist').then(r => r.json()),

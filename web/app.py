@@ -362,10 +362,9 @@ def api_positions():
 @app.get("/api/watchlist")
 def api_watchlist():
     """
-    自选股 + 实时报价（涨跌幅/量比）+ 实时520信号（日线缓存1h）
-    信号来源：
-      ① 实时：_live_signal() 当场跑 520 策略，日线数据 1h TTL 缓存
-      ② 兜底：上次扫描结果（RS分 / 板块方向，实时计算成本高故复用）
+    自选股 + 实时报价（涨跌幅/量比）+ 买点标签（仅按最近扫描结果匹配）
+    买点标签来源：最近一次扫描结果（scan_results）匹配 code；
+    不再实时重算 _live_signal——是否真能买由引擎 check_entry 实时确认，互不影响。
     """
     paper  = _get_paper()
     wlist  = paper.get_watchlist()
@@ -378,9 +377,13 @@ def api_watchlist():
     scan_data = paper.get_scan_results()
     scan_map  = {r["code"]: r for r in (scan_data.get("results") or [])}
 
+    # 当前用户持仓集合 —— 标注自选股是否已持仓
+    held_set  = set(paper.positions().keys())
+
     for w in wlist:
         code = w["code"]
         q    = quotes.get(code, {})
+        w["held"] = code in held_set
 
         # ── 实时行情 ──────────────────────────────────
         w["price"]        = round(q.get("price", 0.0), 2)
@@ -388,15 +391,16 @@ def api_watchlist():
         w["vol_ratio"]    = round(q.get("vol_ratio", 0.0), 2)
         w["turnover_pct"] = round(q.get("turnover_pct", 0.0), 2)
 
-        # ── 实时 520 信号（日线缓存，当日有效）─────────
-        live = _live_signal(code)
-        if live:
-            w["scan_signal"]       = live["signal"]
-            w["scan_reason"]       = live["reason"]
-            w["scan_stop"]         = live["stop_price"]
-            w["scan_score"]        = live["score"]
-            w["scan_cross_date"]   = live["cross_date"]
-            w["scan_score_detail"] = live["score_detail"]
+        # ── 买点标签：只按扫描结果匹配显示（不再实时重算 _live_signal）──
+        #    即展示「最近一次扫描时是否买点」的快照；是否真能买由引擎实时确认，互不影响。
+        hit = scan_map.get(code)
+        if hit:
+            w["scan_signal"]       = hit.get("signal", "")
+            w["scan_reason"]       = hit.get("reason", "")
+            w["scan_stop"]         = hit.get("stop_price", 0.0)
+            w["scan_score"]        = hit.get("score", 0)
+            w["scan_cross_date"]   = hit.get("cross_date", "")
+            w["scan_score_detail"] = hit.get("score_detail", [])
         else:
             w["scan_signal"]       = ""
             w["scan_reason"]       = ""
@@ -405,8 +409,7 @@ def api_watchlist():
             w["scan_cross_date"]   = ""
             w["scan_score_detail"] = []
 
-        # ── RS分、板块方向和行业名：复用上次扫描结果 ──────
-        hit = scan_map.get(code)
+        # ── RS分、板块方向、行业名、AI评分：同取自扫描结果 ──────
         w["scan_rs"]          = hit.get("rs_score",    None) if hit else None
         w["scan_sector_dir"]  = hit.get("sector_dir",  "")   if hit else ""
         w["scan_sector_name"] = hit.get("sector_name", "")   if hit else ""
@@ -600,9 +603,33 @@ def api_trade_void(order_id: int):
 
 @app.get("/api/scan")
 def api_scan():
-    """最新一次扫描结果"""
+    """最新一次扫描结果（标注是否已持仓 + 实时当日涨跌幅/现价）"""
     paper = _get_paper()
-    return jsonify(paper.get_scan_results())
+    data  = paper.get_scan_results()
+    held  = set(paper.positions().keys())
+    results = data.get("results", [])
+    # 实时报价覆盖：价格 / 当日涨跌幅（取不到则保留扫描时静态值，如停牌）
+    quotes = _live_quotes_full([r["code"] for r in results]) if results else {}
+    for r in results:
+        r["held"] = r["code"] in held
+        q = quotes.get(r["code"])
+        if q and q.get("price", 0) > 0:
+            r["price"]      = round(q["price"], 2)
+            r["change_pct"] = round(q.get("change_pct", 0.0), 2)
+            r["live"]       = True
+        else:
+            r["live"] = False
+    return jsonify(data)
+
+
+@app.get("/api/hot")
+def api_hot():
+    """今日热门题材榜（同花顺热点聚合）"""
+    try:
+        from scanner.hot_sectors import get_hot
+        return jsonify(get_hot())
+    except Exception as e:
+        return jsonify({"date": "", "themes": [], "error": str(e)})
 
 
 @app.get("/api/scan/status")
@@ -645,5 +672,5 @@ def api_scan_run():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"\n  🚀 520量化 Web  http://localhost:{port}\n")
+    print(f"\n  🚀 D-Trade Web  http://localhost:{port}\n")
     app.run(host="0.0.0.0", port=port, debug=False)

@@ -10,6 +10,24 @@ import pandas as pd
 from dataclasses import dataclass, field
 from enum import Enum
 
+# 回踩「多日持续缩量」加分开关（默认关=现行单日量比；回测验证用）
+# 含义：近3日均量 ≤ 近20日均量 × MULTIDAY_SHRINK_RATIO → 浮筹持续清洗，更可信
+# BONUS 设大值(如100)+无封顶评分 → 缩量股在 top_n 精选里被优先选入（选股层面优先），
+#   而买入排序仍走默认"粘合→盈亏比"（粘合仍优先）。
+MULTIDAY_SHRINK = False
+MULTIDAY_SHRINK_RATIO = 0.8
+MULTIDAY_SHRINK_BONUS = 100
+
+# 评分上限：默认 100（线上展示口径）；回测/调参时可设大值令加分项充分区分排序
+SCORE_MAX = 100
+
+# 回踩「上方空间」过滤（默认关；回测验证用）：
+#   要求 近 UPSIDE_LOOKBACK 日最高 ≥ 当日收盘 ×(1+UPSIDE_MIN_ROOM)，
+#   即到近期高点至少有 UPSIDE_MIN_ROOM 的上方空间，否则视为潜力不足、过滤掉。
+UPSIDE_ROOM_FILTER = False
+UPSIDE_LOOKBACK = 20
+UPSIDE_MIN_ROOM = 0.05
+
 
 class Signal(Enum):
     BUY_GOLDEN_CROSS = "金叉买点"
@@ -216,7 +234,7 @@ class Strategy520:
         # RSI + 换手率趋势
         self._append_rsi_turnover_score(last, detail)
 
-        score = max(0, min(100, sum(d for d, _ in detail)))
+        score = max(0, min(SCORE_MAX, sum(d for d, _ in detail)))
 
         days_str = "今日" if days_ago == 0 else f"{days_ago}日前"
         vol_desc = (
@@ -313,6 +331,11 @@ class Strategy520:
         # 质量收紧：必须「缩量回踩」或「针形支撑」，剔除"带量站回MA5"这类较弱形态
         if not (vol_shrink or broke_and_recovered):
             return None
+        # 上方空间过滤（可选）：近X日最高距当日收盘不足 MIN_ROOM → 潜力不足，剔除
+        if UPSIDE_ROOM_FILTER and len(df) >= UPSIDE_LOOKBACK:
+            recent_high = float(df["high"].tail(UPSIDE_LOOKBACK).max())
+            if recent_high < float(last["close"]) * (1 + UPSIDE_MIN_ROOM):
+                return None
 
         # ── 评分 ──────────────────────────────────────
         detail: list = [(65, "回踩基础")]
@@ -323,6 +346,14 @@ class Strategy520:
             detail.append((15, "缩量阳线站回MA5"))
         if last["close"] > ma5:
             detail.append((10, "站上MA5"))
+
+        # 多日持续缩量（近3日均量 ≤ 近20日均量×ratio）→ 浮筹持续清洗
+        # 加分 = MULTIDAY_SHRINK_BONUS（设大值→缩量股优先入选 top_n 精选）
+        if MULTIDAY_SHRINK and len(df) >= 20:
+            v = df["vol"].astype(float)
+            avg3, avg20 = v.tail(3).mean(), v.tail(20).mean()
+            if avg20 > 0 and avg3 <= avg20 * MULTIDAY_SHRINK_RATIO:
+                detail.append((MULTIDAY_SHRINK_BONUS, "持续缩量·浮筹清"))
 
         # 盈亏比：越贴近MA20，止损越紧、上方空间越大（回踩选股核心）
         if dev_ratio <= 0.01:
@@ -348,7 +379,7 @@ class Strategy520:
         # RSI + 换手率趋势
         self._append_rsi_turnover_score(last, detail)
 
-        score = max(0, min(100, sum(d for d, _ in detail)))
+        score = max(0, min(SCORE_MAX, sum(d for d, _ in detail)))
 
         # 前期金叉日期
         try:
@@ -435,7 +466,7 @@ class Strategy520:
         # RSI + 换手率趋势
         self._append_rsi_turnover_score(last, detail)
 
-        score = max(0, min(100, sum(d for d, _ in detail)))
+        score = max(0, min(SCORE_MAX, sum(d for d, _ in detail)))
 
         try:
             cross_date = str(last["datetime"])[:10]

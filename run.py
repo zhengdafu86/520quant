@@ -44,7 +44,7 @@ def _build_monitor():
     """
     from monitor.engine import MultiUserMonitor
 
-    multi = MultiUserMonitor(interval=30, paper_mode=PAPER_MODE).build()
+    multi = MultiUserMonitor(interval=10, paper_mode=PAPER_MODE).build()
 
     primary = multi.engines.get(DEFAULT_USER)
     if primary is not None:

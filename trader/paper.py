@@ -242,7 +242,10 @@ def _init_scan_db(conn: sqlite3.Connection):
             score_detail TEXT DEFAULT '[]',
             change_pct   REAL DEFAULT 0,
             ai_score     REAL DEFAULT 0,
-            ai_comment   TEXT DEFAULT ''
+            ai_comment   TEXT DEFAULT '',
+            main_net_today REAL,
+            main_net_5d    REAL,
+            main_net_10d   REAL
         );
     """)
     conn.commit()
@@ -251,6 +254,9 @@ def _init_scan_db(conn: sqlite3.Connection):
         ("change_pct", "REAL DEFAULT 0"),
         ("ai_score",   "REAL DEFAULT 0"),    # AI 综合评分（技术+资金+消息）
         ("ai_comment", "TEXT DEFAULT ''"),   # AI 评分理由（一句话）
+        ("main_net_today", "REAL"),          # 当日主力净额（万元），NULL=未采集
+        ("main_net_5d",    "REAL"),          # 近5日主力净额（万元）
+        ("main_net_10d",   "REAL"),          # 近10日主力净额（万元）
     ):
         try:
             conn.execute(f"ALTER TABLE scan_results ADD COLUMN {col} {ddl}")
@@ -761,7 +767,8 @@ class PaperAccount:
         rows = self._scan_conn.execute(
             "SELECT code,name,price,signal,reason,score,stop_price,"
             "rs_score,sector_dir,cross_date,sector_name,score_detail,"
-            "COALESCE(change_pct,0),COALESCE(ai_score,0),COALESCE(ai_comment,'') "
+            "COALESCE(change_pct,0),COALESCE(ai_score,0),COALESCE(ai_comment,''),"
+            "main_net_today,main_net_5d,main_net_10d "
             "FROM scan_results WHERE scan_date=? ORDER BY score DESC",
             (scan_date,)
         ).fetchall()
@@ -784,10 +791,41 @@ class PaperAccount:
                     "change_pct":   r[12] if r[12] is not None else 0.0,
                     "ai_score":     r[13] if r[13] is not None else 0.0,
                     "ai_comment":   r[14] or "",
+                    "main_net_today": r[15],   # 万元，None=未采集
+                    "main_net_5d":    r[16],
+                    "main_net_10d":   r[17],
                 }
                 for r in rows
             ]
         }
+
+    def update_fund_flow(self, fund: dict, scan_date: str = None) -> int:
+        """
+        把主力净额写回扫描结果（每日扫描后由监控采集，仅展示/供AI评分参考）。
+        fund: {code: (今日万, 5日万, 10日万)}；值为 None 的项跳过。
+        scan_date 为空时取最新一天。返回更新条数。
+        """
+        if not scan_date:
+            row = self._scan_conn.execute(
+                "SELECT scan_date FROM scan_results ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if not row:
+                return 0
+            scan_date = row[0]
+        n = 0
+        for code, v in (fund or {}).items():
+            if not v:
+                continue
+            try:
+                cur = self._scan_conn.execute(
+                    "UPDATE scan_results SET main_net_today=?, main_net_5d=?, main_net_10d=? "
+                    "WHERE scan_date=? AND code=?",
+                    (float(v[0]), float(v[1]), float(v[2]), scan_date, code))
+                n += cur.rowcount
+            except Exception:
+                pass
+        self._scan_conn.commit()
+        return n
 
     def update_ai_scores(self, scores: dict, scan_date: str = None) -> int:
         """

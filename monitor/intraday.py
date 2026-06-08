@@ -16,6 +16,8 @@ from monitor.realtime import (get_quote, get_minute_bars,
 # ── 可寻优参数（默认 = 现行实盘值；回测寻优时由 sweep 覆盖，不影响线上）──
 HARD_STOP_PCT     = -5.0   # ① 硬止损阈值(%)
 TREND_STOP_BARS   = 2      # ② 趋势止损：近若干根5分钟K中跌破MA20的根数阈值（默认2=现行"3中2"）
+STOP_CONFIRM_BARS = 1      # ③ 止损价确认根数：1=单次触碰(现行)；≥2=需N根5分钟K收在止损价下才触发(防早盘插针)
+AMPLITUDE_CAP     = 5.0     # 入场当日振幅上限(%)：(当日最高-最低)/最低 ≥ 此值则暂缓入场（筹码不稳）
 DD_THRESH_MULT    = 1.0    # ⑤ 浮盈回落容忍倍数（>1 = 放宽、更能扛回调、拉长持有）
 DISABLE_PEAK_LOCK = False  # 三合二：关掉⑥峰值锁利（与追踪止损大量重叠）
 MAX_HOLD_DAYS     = 0      # ⑦ 条件时间止损：持有交易日上限（0=关）
@@ -148,11 +150,11 @@ class IntradayEngine:
         # ── 7. 当日振幅 ──────────────────────────────
         if high > 0 and low > 0:
             amplitude = (high - low) / low * 100
-            if amplitude >= 5.0:
-                conds.append(["当日振幅", False, f"振幅{amplitude:.1f}%≥5%，筹码不稳，暂缓入场"])
+            if amplitude >= AMPLITUDE_CAP:
+                conds.append(["当日振幅", False, f"振幅{amplitude:.1f}%≥{AMPLITUDE_CAP:.0f}%，筹码不稳，暂缓入场"])
                 return IntradaySignal(Action.WAIT, price,
-                    f"当日振幅{amplitude:.1f}%≥5%，筹码不稳，等待企稳", conditions=conds)
-            conds.append(["当日振幅", True, f"振幅{amplitude:.1f}%<5%，筹码稳定"])
+                    f"当日振幅{amplitude:.1f}%≥{AMPLITUDE_CAP:.0f}%，筹码不稳，等待企稳", conditions=conds)
+            conds.append(["当日振幅", True, f"振幅{amplitude:.1f}%<{AMPLITUDE_CAP:.0f}%，筹码稳定"])
 
         # ── 8. 价格 vs MA20 ──────────────────────────
         last = daily_df.iloc[-1]
@@ -314,13 +316,28 @@ class IntradayEngine:
         else:
             conds.append(["②趋势止损", True, f"价格{price:.2f}≥MA20={ma20:.2f}，趋势完好"])
 
-        # ③ 止损价
+        # ③ 止损价（可选 N 根5分钟K确认，防早盘单次插针把保本/移动止损洗出）
         if price < stop_price:
-            conds.append(["③止损价", False, f"价格{price:.2f}<止损价{stop_price:.2f}，触发"])
-            return IntradaySignal(Action.SELL_STOP, price,
-                f"触及止损价{stop_price:.2f} | 盈亏{pnl_pct:.1f}%",
-                urgency="urgent", conditions=conds)
-        conds.append(["③止损价", True, f"价格{price:.2f}≥止损价{stop_price:.2f}，安全"])
+            if STOP_CONFIRM_BARS <= 1:
+                conds.append(["③止损价", False, f"价格{price:.2f}<止损价{stop_price:.2f}，触发"])
+                return IntradaySignal(Action.SELL_STOP, price,
+                    f"触及止损价{stop_price:.2f} | 盈亏{pnl_pct:.1f}%",
+                    urgency="urgent", conditions=conds)
+            _win = max(STOP_CONFIRM_BARS, TREND_STOP_BARS)
+            min_df = get_minute_bars(code, freq="5m", count=max(10, _win))
+            below = 0
+            if min_df is not None and not min_df.empty:
+                below = sum(1 for c in min_df["close"].tail(STOP_CONFIRM_BARS) if c < stop_price)
+            if below >= STOP_CONFIRM_BARS:
+                conds.append(["③止损价", False,
+                    f"价格{price:.2f}<止损价{stop_price:.2f}，连续{below}根5分钟K确认，触发"])
+                return IntradaySignal(Action.SELL_STOP, price,
+                    f"触及止损价{stop_price:.2f} 持续{below}根5分钟K | 盈亏{pnl_pct:.1f}%",
+                    urgency="urgent", conditions=conds)
+            conds.append(["③止损价", True,
+                f"价格{price:.2f}<止损价{stop_price:.2f}，但仅{below}根5分钟K，未达{STOP_CONFIRM_BARS}根确认"])
+        else:
+            conds.append(["③止损价", True, f"价格{price:.2f}≥止损价{stop_price:.2f}，安全"])
 
         # ③' 接近涨停锁利
         chg_pct    = float(quote.get("change_pct", 0.0) or 0.0)

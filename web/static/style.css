@@ -154,6 +154,35 @@
   border-left: 3px solid #ffb300;
 }
 
+/* ── 今日热点题材面板 ────────────────────── */
+.hot-panel:empty { display: none; }
+.hot-title { font-size: 13px; font-weight: 700; margin-bottom: 6px; }
+.hot-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.hot-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 12px; padding: 3px 9px; border-radius: 12px;
+  background: #fff3e0; color: #e65100; border: 1px solid #ffcc80;
+  cursor: default;
+}
+.hot-chip b { font-size: 11px; background: #e65100; color: #fff;
+  border-radius: 8px; padding: 0 5px; }
+
+/* ── 已持仓标记 ────────────────────────── */
+.held-badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: #e3f2fd;
+  color: #1565c0;
+  border: 1px solid #90caf9;
+  letter-spacing: 0.2px;
+}
+.stock-card.card-held {
+  border-left: 3px solid #1e88e5;
+}
+
 /* ── 针形支撑标记 ────────────────────────── */
 .hammer-badge {
   display: inline-block;

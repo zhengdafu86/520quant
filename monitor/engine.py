@@ -100,6 +100,8 @@ class MonitorEngine:
         self._broker     = None          # 可注入券商接口
         self._paper      = PaperAccount(user=user) if paper_mode else None
         self._warn_cooldown: dict[str, float] = {}   # code -> 上次预警时间戳
+        self._amp_dead: set[str] = set()  # 当日因振幅出局的票（振幅不可逆，整日跳过）
+        self._amp_dead_date = ""          # _amp_dead 所属日期，跨日清空
 
     # ── 持仓管理 ──────────────────────────────────
 
@@ -225,9 +227,15 @@ class MonitorEngine:
 
     def _tick(self):
         """单次轮询：获取报价 → 检查信号"""
+        # 跨日清空"振幅出局"名单（振幅当日不可逆，但隔日重新评估）
+        _today = datetime.now().strftime("%Y-%m-%d")
+        if self._amp_dead_date != _today:
+            self._amp_dead = set()
+            self._amp_dead_date = _today
+
         with self._lock:
             pos_codes   = list(self.positions.keys())
-            watch_codes = list(self.watchlist.keys())
+            watch_codes = [c for c in self.watchlist.keys() if c not in self._amp_dead]
 
         # 510300（沪深300 ETF）随报价一并拉取，用于日内大盘监控
         all_codes = list(set(pos_codes + watch_codes + ["510300"]))
@@ -417,7 +425,13 @@ class MonitorEngine:
                 self._do_buy(code, item.name, price, shares, sig.reason,
                             signal_type=item.signal, conditions=sig.conditions)
             else:
-                log(f"候选 {item.name}({code}) {quote['price']:.2f} | {sig.reason}")
+                # 振幅不可逆（当日最高/最低只会越拉越开）→ 一旦因振幅出局，整日不会再回到买点，
+                # 标记后续轮询直接跳过；其余可逆条件（偏离/跌破MA20等）不标记，每轮照常重判。
+                if any(c[0] == "当日振幅" and not c[1] for c in (sig.conditions or [])):
+                    self._amp_dead.add(code)
+                    log(f"候选 {item.name}({code}) 振幅出局，今日不再检查 | {sig.reason}")
+                else:
+                    log(f"候选 {item.name}({code}) {quote['price']:.2f} | {sig.reason}")
 
     def _do_buy(self, code: str, name: str, price: float,
                 shares: int, reason: str, signal_type: str = "",
@@ -684,9 +698,9 @@ class MonitorEngine:
             else:
                 log("非交易时段，等待...")
 
-            # 14:30-15:00 止盈窗口加密轮询（15s），其余时段正常间隔（30s）
+            # 14:30-15:00 止盈窗口加密轮询，其余时段按 self.interval（默认10s）
             from monitor.realtime import is_profit_exit_window
-            time.sleep(15 if is_profit_exit_window() else self.interval)
+            time.sleep(min(15, self.interval) if is_profit_exit_window() else self.interval)
 
     def start(self, background: bool = True):
         self._running = True
@@ -833,9 +847,24 @@ class MultiUserMonitor:
                 _summary_sent = True
 
             # 15:35 全市场扫描（共享，只跑一次，不分用户）
+            # 扫描完成后紧接着采集资金流（一波 clist，约6请求；顺序保证、IP友好）
             if now.hour == 15 and now.minute == 35 and not _scan_sent:
-                from scanner.market_scan import scanner
-                threading.Thread(target=scanner.run, daemon=True).start()
+                def _scan_then_fund():
+                    from scanner.market_scan import scanner
+                    scanner.run()
+                    try:
+                        from scanner.ai_score import collect_fund_to_db
+                        n = collect_fund_to_db()
+                        log(f"资金流采集入库: {n} 只", "INFO")
+                    except Exception as e:
+                        log(f"资金流采集失败: {e}", "WARN")
+                    try:
+                        from scanner.hot_sectors import collect_to_db as _hot
+                        m = _hot()
+                        log(f"热门题材采集入库: {m} 个", "INFO")
+                    except Exception as e:
+                        log(f"热门题材采集失败: {e}", "WARN")
+                threading.Thread(target=_scan_then_fund, daemon=True).start()
                 _scan_sent = True
 
             # 15:40 盘中分钟数据落库（扫描后，覆盖当日完整 5 分钟K；后台线程）
@@ -866,7 +895,7 @@ class MultiUserMonitor:
                 log("非交易时段，等待...")
 
             from monitor.realtime import is_profit_exit_window
-            time.sleep(15 if is_profit_exit_window() else self.interval)
+            time.sleep(min(15, self.interval) if is_profit_exit_window() else self.interval)
 
     def start(self, background: bool = True):
         self._running = True
