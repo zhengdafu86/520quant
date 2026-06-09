@@ -21,6 +21,7 @@ check_entry / check_position，并复刻追踪止损、6 仓限制、T+1、佣�
 """
 from __future__ import annotations
 
+import os
 import sys
 import bisect
 import argparse
@@ -102,7 +103,7 @@ def _update_stop(pos: dict, price: float, ma5: float, tiers=None, ma5_min: float
 
 def _load(code: str):
     """返回 (daily_df_with_date, m5_by_date, date_list)"""
-    daily = db.get(code, freq="day", bars=320)
+    daily = db.get(code, freq="day", bars=int(os.environ.get("BT_DAILY_BARS", 320)))
     if daily is None or daily.empty:
         return None, None, None
     daily = daily.copy()
@@ -110,9 +111,14 @@ def _load(code: str):
     bars = ids.get_bars(code, "5m")            # [(dt,o,h,l,c,v), ...]
     if not bars:
         return None, None, None
+    # 5分钟仅载入所需窗口，避免把全库(含2024回补)都读进内存→OOM
+    _lo = os.environ.get("BT_MIN_DATE", "")
+    _hi = os.environ.get("BT_MAX_DATE", "")
     m5 = {}
     for dt, o, h, l, c, v in bars:
         d = dt[:10]
+        if (_lo and d < _lo) or (_hi and d > _hi):
+            continue
         m5.setdefault(d, []).append((dt, o, h, l, c, v))
     return daily, m5, daily["d"].tolist()
 
@@ -198,7 +204,7 @@ def _load_ctx_compute(codes):
         cand_map[c] = _precompute_candidates(d)
         day_total[c] = {dt: sum(float(b[5]) for b in bars) for dt, bars in m5.items()}
         sdates[c] = sorted(m5.keys())
-    mk = db.get_market(bars=320).copy()
+    mk = db.get_market(bars=int(os.environ.get("BT_DAILY_BARS", 320))).copy()
     mk["d"] = mk["datetime"].astype(str).str[:10]
     return {"daily": daily_map, "m5": m5_map, "cand": cand_map,
             "day_total": day_total, "sdates": sdates, "mk": mk}
@@ -206,7 +212,9 @@ def _load_ctx_compute(codes):
 
 def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
              top_n=8, atr_mult=0.0, scale_pct=0.0, priority="squeeze_risk",
-             tiers=None, ma5_min=10.0, stop_on_low=False, tail_entry=False):
+             tiers=None, ma5_min=10.0, stop_on_low=False, tail_entry=False,
+             market_mode="ma20_ma60", macd_confirm="off", top_div="off",
+             limit_lock="off"):
     """在 ctx 上跑一次忠实回测（使用 intraday 模块当前的止损/止盈参数）。
     top_n: 每日"精选"上限——只在评分最高的 top_n 只信号股里建仓（0=不设上限）。
     返回 (trades, equity_curve, positions)。"""
@@ -249,6 +257,45 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
             return -9.9
         return (c_now / c_20 - 1) - _mk_ret20.get(str(d.iloc[asof - 1]["d"]), 0.0)
 
+    def _macd_ok(code, asof, mode):
+        """MACD柱动能确认（信号日=asof-1）：
+        'up'     柱拐头向上（由缩转增的"增"）：macd[j] > macd[j-1]
+        'trough' 缩转增（更严）：前一根还在缩(macd[j-1]<=macd[j-2])，这根转增
+        数据不足一律放行(返回True)，不误杀。"""
+        if mode == "off":
+            return True
+        d = daily_map[code]
+        j = asof - 1
+        if j < 2 or "macd" not in d.columns:
+            return True
+        m = d["macd"].values
+        if pd.isna(m[j]) or pd.isna(m[j - 1]):
+            return True
+        up = m[j] > m[j - 1]
+        if mode == "trough":
+            return bool(up and (pd.isna(m[j - 2]) or m[j - 1] <= m[j - 2]))
+        return bool(up)   # 'up'
+
+    def _top_div(sub, N=20):
+        """MACD顶背离（用截至T-1的日线sub）：价格较"前期DIF高点日"创了更高高点，
+        但当前DIF反而更低，且仍在零轴上方(高位)。捕捉均线看不到的价/动能背离。"""
+        if sub is None or len(sub) < N + 2 or "dif" not in sub.columns:
+            return False
+        dif = sub["dif"].values
+        cl = sub["close"].values
+        j = len(sub) - 1
+        if pd.isna(dif[j]):
+            return False
+        # 前N根(不含当前)里 DIF 的高点位置
+        lo = j - N
+        p, pv = -1, -1e18
+        for k in range(lo, j):
+            if not pd.isna(dif[k]) and dif[k] > pv:
+                pv, p = dif[k], k
+        if p < 0:
+            return False
+        return bool(cl[j] > cl[p] and dif[j] < dif[p] and dif[j] > 0)
+
     def vol_ratio(code, T, i, day):
         elapsed = _elapsed_min(day[i][0])
         if elapsed <= 0:
@@ -268,7 +315,19 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
             return True
         last = sub.iloc[-1]
         try:
-            return float(last["ma20"]) > float(last["ma60"])
+            ma20 = float(last["ma20"]); ma60 = float(last["ma60"])
+            cross = ma20 > ma60
+            if market_mode == "ma20_ma60":           # 现行：金叉
+                return cross
+            slope = float(last.get("ma20_slope", 0))
+            rising = slope > 0                        # MA20 转头向上
+            if market_mode == "slope":                # 仅看 MA20 斜率转正(更灵敏)
+                return rising
+            if market_mode == "either":               # 金叉 或 斜率转正(更快回场)
+                return cross or rising
+            if market_mode == "always":               # 无大盘过滤(参照)
+                return True
+            return cross
         except Exception:
             return True
 
@@ -311,6 +370,9 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
             if cm and T in cm:
                 sig, asof, score = cm[T]
                 todays.append((c, sig, asof, score))
+        # 方案A: MACD柱动能确认作为进场前置条件（off=不启用，与现行等价）
+        if macd_confirm != "off":
+            todays = [t for t in todays if _macd_ok(t[0], t[2], macd_confirm)]
         # A: 精选 Top-N —— 按评分降序只保留前 top_n 只（复刻实盘"只买精选"）
         if top_n and top_n > 0 and len(todays) > top_n:
             todays.sort(key=lambda it: -it[3])
@@ -400,6 +462,15 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
                         pos["shares"] -= half
                         pos["scaled"] = True
 
+                # 方案B: MACD顶背离 → 减半仓(half)/清仓(full)。日级信号,每仓一生只触发一次。
+                if top_div != "off" and not pos.get("div_cut") and _top_div(sub):
+                    pos["div_cut"] = True
+                    if top_div == "full":
+                        _sell(pos["shares"], "TOP_DIV"); del positions[code]; continue
+                    half = (pos["shares"] // 200) * 100
+                    if half >= 100:
+                        _sell(half, "TOP_DIV_HALF"); pos["shares"] -= half
+
                 # 止损/止盈决策
                 sold = False
                 if atr_mult > 0 and pos["atr"] > 0:
@@ -415,7 +486,19 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
                     take = (sig.action == Action.SELL_PROFIT) if atr_mult > 0 \
                            else (sig.action in (Action.SELL_STOP, Action.SELL_PROFIT))
                     if take:
-                        _sell(pos["shares"], sig.action.name); del positions[code]
+                        is_limit = "涨停" in (getattr(sig, "reason", "") or "")
+                        if is_limit and limit_lock == "disable":
+                            pass            # ① 不锁利：忽略涨停止盈，交给追踪止损管理
+                        elif is_limit and limit_lock == "half":
+                            if not pos.get("ll_half"):   # ② 减半留底仓(只减一次)
+                                _half = (pos["shares"] // 200) * 100
+                                if _half >= 100:
+                                    _sell(_half, "LIMIT_LOCK_HALF"); pos["shares"] -= _half
+                                pos["ll_half"] = True
+                            # 留底仓不del，继续由追踪止损/其它规则管理
+                        else:
+                            _nm = "LIMIT_LOCK" if is_limit else sig.action.name
+                            _sell(pos["shares"], _nm); del positions[code]
 
             # ── 进场 ──（尾盘模式跳过盘中进场，改在日终统一尾盘买）
             if mkt_ok and not tail_entry:

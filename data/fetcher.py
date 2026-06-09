@@ -190,6 +190,13 @@ class KlineDB:
         _rs        = _avg_gain / _avg_loss.where(_avg_loss != 0, other=float("nan"))
         df["rsi14"] = (100 - 100 / (1 + _rs)).round(1)
 
+        # MACD(12,26,9) — DIF/DEA/柱状(红绿柱)；EMA 用 adjust=False，与通达信/同花顺口径一致
+        _ema12 = df["close"].ewm(span=12, adjust=False).mean()
+        _ema26 = df["close"].ewm(span=26, adjust=False).mean()
+        df["dif"]  = (_ema12 - _ema26).round(3)
+        df["dea"]  = df["dif"].ewm(span=9, adjust=False).mean().round(3)
+        df["macd"] = ((df["dif"] - df["dea"]) * 2).round(3)   # 柱状: >0红柱 / <0绿柱
+
         # 换手率趋势：最近5日中"价涨 + 换手放大"的天数（0-5）
         # ≥3 → 主力持续建仓信号；0 → 量价背离，市场萎缩
         _up_exp = (

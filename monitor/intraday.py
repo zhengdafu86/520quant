@@ -20,6 +20,8 @@ STOP_CONFIRM_BARS = 1      # ③ 止损价确认根数：1=单次触碰(现行)�
 AMPLITUDE_CAP     = 5.0     # 入场当日振幅上限(%)：(当日最高-最低)/最低 ≥ 此值则暂缓入场（筹码不稳）
 DD_THRESH_MULT    = 1.0    # ⑤ 浮盈回落容忍倍数（>1 = 放宽、更能扛回调、拉长持有）
 DISABLE_PEAK_LOCK = False  # 三合二：关掉⑥峰值锁利（与追踪止损大量重叠）
+LIMIT_LOCK_ENABLED = False # ③'涨停锁利：回测验证 disable 全面更优(全年36.2→41.1, 卡玛7.71→8.41,
+                           #   Q1夏+3.1/Q2秋+2.3pp, 下行有界)→关掉涨停卖出, 交追踪止损博连板续涨
 MAX_HOLD_DAYS     = 0      # ⑦ 条件时间止损：持有交易日上限（0=关）
 STALE_PNL         = 3.0    # ⑦ 老仓清理盈利门槛(%)：持有超限且盈利<此值才清坑让位
 
@@ -346,20 +348,27 @@ class IntradayEngine:
             if _is_squeeze:
                 _today_str = datetime.now().strftime("%Y-%m-%d")
                 if first_limit_up_date and first_limit_up_date < _today_str:
+                    if LIMIT_LOCK_ENABLED:
+                        conds.append(["③'涨停锁利", False,
+                            f"涨幅{chg_pct:.1f}%≥9%，粘合发散非首涨停日（首次={first_limit_up_date}），锁利"])
+                        return IntradaySignal(Action.SELL_PROFIT, price,
+                            f"当日涨幅{chg_pct:.1f}%，粘合发散非首涨停日主动锁利"
+                            f"（首涨停={first_limit_up_date}）| 盈亏{pnl_pct:+.1f}%",
+                            urgency="urgent", conditions=conds)
+                    conds.append(["③'涨停锁利", True,
+                        f"涨幅{chg_pct:.1f}%≥9%(粘合非首板)，不锁利·交追踪止损博续涨"])
+                else:
+                    conds.append(["③'涨停锁利", True,
+                        f"涨幅{chg_pct:.1f}%≥9%，粘合发散首涨停日（{first_limit_up_date or '今日'}），持有观察"])
+            else:
+                if LIMIT_LOCK_ENABLED:
                     conds.append(["③'涨停锁利", False,
-                        f"涨幅{chg_pct:.1f}%≥9%，粘合发散非首涨停日（首次={first_limit_up_date}），锁利"])
+                        f"涨幅{chg_pct:.1f}%≥9%，金叉/回踩触发涨停锁利"])
                     return IntradaySignal(Action.SELL_PROFIT, price,
-                        f"当日涨幅{chg_pct:.1f}%，粘合发散非首涨停日主动锁利"
-                        f"（首涨停={first_limit_up_date}）| 盈亏{pnl_pct:+.1f}%",
+                        f"当日涨幅{chg_pct:.1f}%接近涨停，主动锁利 | 盈亏{pnl_pct:+.1f}%",
                         urgency="urgent", conditions=conds)
                 conds.append(["③'涨停锁利", True,
-                    f"涨幅{chg_pct:.1f}%≥9%，但粘合发散首涨停日（{first_limit_up_date or '今日'}），持有观察"])
-            else:
-                conds.append(["③'涨停锁利", False,
-                    f"涨幅{chg_pct:.1f}%≥9%，金叉/回踩触发涨停锁利"])
-                return IntradaySignal(Action.SELL_PROFIT, price,
-                    f"当日涨幅{chg_pct:.1f}%接近涨停，主动锁利 | 盈亏{pnl_pct:+.1f}%",
-                    urgency="urgent", conditions=conds)
+                    f"涨幅{chg_pct:.1f}%≥9%(金叉/回踩)，不锁利·交追踪止损博续涨"])
         else:
             conds.append(["③'涨停锁利", True,
                 f"涨幅{chg_pct:.1f}%<9%{'且盈亏≤0' if pnl_pct<=0 else ''}，未触发"])

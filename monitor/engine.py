@@ -102,6 +102,7 @@ class MonitorEngine:
         self._warn_cooldown: dict[str, float] = {}   # code -> 上次预警时间戳
         self._amp_dead: set[str] = set()  # 当日因振幅出局的票（振幅不可逆，整日跳过）
         self._amp_dead_date = ""          # _amp_dead 所属日期，跨日清空
+        self._wl_sig = None               # 自选表签名，用于盘中检测变化即时重载
 
     # ── 持仓管理 ──────────────────────────────────
 
@@ -208,8 +209,10 @@ class MonitorEngine:
         scan_data  = self._paper.get_scan_results()   # 共享 market.db
         scan_score = {r["code"]: int(r.get("score") or 0)
                       for r in (scan_data.get("results") or [])}
+        rows = self._paper.get_watchlist()
+        table_codes = {w["code"] for w in rows}
         loaded = 0
-        for w in self._paper.get_watchlist():
+        for w in rows:
             code = w["code"]
             if code in self.positions:
                 continue   # 已持仓，不再作为候选
@@ -220,8 +223,31 @@ class MonitorEngine:
                 score=scan_score.get(code, 0),
             )
             loaded += 1
+        # 剪枝：把内存候选集对齐成「表中且未持仓」——移除已从表删除的旧候选
+        # （手动删自选 / 候选被取消），以及已转持仓的残留。否则只增不删会残留。
+        with self._lock:
+            stale = [c for c in self.watchlist
+                     if c not in table_codes or c in self.positions]
+            for c in stale:
+                self.watchlist.pop(c, None)
+        if stale:
+            log(f"[{self.user or '默认'}] 移除失效候选 {len(stale)} 只: "
+                f"{','.join(stale)}", "INFO")
+        self._wl_sig = self._wl_sig_of(rows)   # 记录本次加载后的表签名
         if loaded:
             log(f"[{self.user or '默认'}] 加载自选 {loaded} 只", "INFO")
+
+    @staticmethod
+    def _wl_sig_of(rows) -> tuple:
+        """自选表签名：(code, signal, priority) 排序元组。
+        增/删/改优先级/改信号都会改变签名，用于盘中检测表变化。"""
+        return tuple(sorted(
+            (w["code"], w.get("signal", "") or "", w.get("priority", "") or "")
+            for w in rows
+        ))
+
+    def _current_wl_sig(self) -> tuple:
+        return self._wl_sig_of(self._paper.get_watchlist())
 
     # ── 核心轮询 ──────────────────────────────────
 
@@ -232,6 +258,16 @@ class MonitorEngine:
         if self._amp_dead_date != _today:
             self._amp_dead = set()
             self._amp_dead_date = _today
+
+        # 候选表变化即时重载：Web 手动加/删候选后，≤1个tick(约10s)内自动纳入监控，
+        # 无需等次日09:15或盘后扫描。签名比对，仅在真变化时重载（无日志刷屏）。
+        if self.paper_mode and self._paper:
+            try:
+                if self._current_wl_sig() != self._wl_sig:
+                    log(f"[{self.user or '默认'}] 检测到自选变化，重载候选", "INFO")
+                    self.load_watchlist_from_paper()   # 内部更新 _wl_sig
+            except Exception as e:
+                log(f"[{self.user or '默认'}] 自选变化检测失败: {e}", "WARN")
 
         with self._lock:
             pos_codes   = list(self.positions.keys())
@@ -827,14 +863,18 @@ class MultiUserMonitor:
         while self._running:
             now = datetime.now()
 
-            # 09:15 同步用户名册 + 刷新各用户候选股日线（集合竞价前，每天一次）
+            # 09:15 同步用户名册 + 重载各用户自选(纳入昨日盘后扫描新候选) + 刷新日线
+            # （集合竞价前，每天一次）
+            # 注：load_watchlist_from_paper 会拉取 watchlist 表全量候选(含盘后新增)，
+            #     add_watch 内部顺带取最新日线；之后 _refresh 再统一对齐 bars=65。
             if now.hour == 9 and now.minute >= 15 and not _df_refreshed:
                 self._sync_users()
-                for eng in list(self.engines.values()):
+                for user, eng in list(self.engines.items()):
                     try:
+                        eng.load_watchlist_from_paper()
                         eng._refresh_watchlist_daily_df()
                     except Exception as e:
-                        log(f"刷新日线失败: {e}", "WARN")
+                        log(f"[{user}] 盘前重载自选/刷新日线失败: {e}", "WARN")
                 _df_refreshed = True
 
             # 15:30 各用户收盘汇总
@@ -852,6 +892,12 @@ class MultiUserMonitor:
                 def _scan_then_fund():
                     from scanner.market_scan import scanner
                     scanner.run()
+                    # 扫描完成→立即重载各用户自选，让当晚即纳入新候选(不必等次日09:15)
+                    for user, eng in list(self.engines.items()):
+                        try:
+                            eng.load_watchlist_from_paper()
+                        except Exception as e:
+                            log(f"[{user}] 扫描后重载自选失败: {e}", "WARN")
                     try:
                         from scanner.ai_score import collect_fund_to_db
                         n = collect_fund_to_db()
