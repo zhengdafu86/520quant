@@ -632,6 +632,50 @@ def api_hot():
         return jsonify({"date": "", "themes": [], "error": str(e)})
 
 
+@app.get("/api/strength")
+def api_strength():
+    """市场强弱仪表盘：指数趋势+全市场涨跌家数+本账户近10笔胜率 → 强/中性/弱。"""
+    from collections import defaultdict, deque
+    try:
+        from scanner import market_strength
+        paper = _get_paper()
+        rows = paper._conn.execute(
+            "SELECT code,side,price,shares FROM orders "
+            "WHERE COALESCE(voided,0)=0 ORDER BY id").fetchall()
+        q = defaultdict(deque); wins = []
+        for code, side, price, shares in rows:
+            if side == "BUY":
+                q[code].append([price, shares])
+            else:
+                rem = shares; cost = 0.0; ms = 0
+                while rem > 0 and q[code]:
+                    b = q[code][0]; take = min(rem, b[1])
+                    cost += b[0] * take; ms += take; b[1] -= take; rem -= take
+                    if b[1] <= 0:
+                        q[code].popleft()
+                if ms > 0:
+                    wins.append(1 if price * ms - cost > 0 else 0)
+        recent = wins[-10:]
+        wr = (sum(recent) / len(recent) * 100) if recent else None
+        d = market_strength.compute(recent_winrate=wr, recent_n=len(recent))
+        d["pos_cap"] = paper.get_pos_cap()          # 当前持仓数上限(供前端展示+调节)
+        return jsonify(d)
+    except Exception as e:
+        return jsonify({"verdict": "—", "advice": "数据获取失败", "error": str(e)[:80]})
+
+
+@app.post("/api/settings/poscap")
+def api_set_poscap():
+    """设置持仓数上限(0-4)。0=不开新仓(弱市持币)；只限开仓数量，不改每仓大小。"""
+    paper = _get_paper()
+    try:
+        n = int((request.get_json(silent=True) or {}).get("pos_cap"))
+    except Exception:
+        return jsonify({"ok": False, "msg": "参数无效"})
+    paper.set_pos_cap(n)
+    return jsonify({"ok": True, "pos_cap": paper.get_pos_cap()})
+
+
 @app.get("/api/scan/status")
 def api_scan_status():
     """当前扫描运行状态（前端用于轮询进度）"""

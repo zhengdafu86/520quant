@@ -166,6 +166,11 @@
 }
 .hot-chip b { font-size: 11px; background: #e65100; color: #fff;
   border-radius: 8px; padding: 0 5px; }
+.poscap-sel {
+  font-size: 12px; padding: 2px 8px; margin: 0 4px; border-radius: 6px;
+  background: #fff; color: #1976d2; border: 1px solid #90caf9;
+  font-weight: 700; cursor: pointer;
+}
 
 /* ── 已持仓标记 ────────────────────────── */
 .held-badge {

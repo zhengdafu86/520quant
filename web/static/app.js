@@ -707,7 +707,47 @@ async function loadHotThemes() {
   } catch (e) { cont.innerHTML = ''; }
 }
 
+async function loadStrength() {
+  const cont = document.getElementById('strength-panel');
+  if (!cont) return;
+  try {
+    const d = await fetch('/api/strength').then(r => r.json());
+    if (!d.verdict || d.verdict === '—') { cont.innerHTML = ''; return; }
+    const col = d.verdict === '强' ? '#16a34a' : (d.verdict === '弱' ? '#dc2626' : '#6b7280');
+    const idx = d.index || {}, br = d.breadth || {};
+    const items = [];
+    if (br.up != null) items.push(`涨跌家数 <b>${br.up}:${br.down}</b>(比${br.ratio})`);
+    if (idx.close != null) items.push(`沪深300 ${idx.cross ? '金叉' : '破位'}·MA20${idx.slope_dir}·近10日${idx.ret10 >= 0 ? '+' : ''}${idx.ret10}%`);
+    if (idx.vol_ratio != null) items.push(`量能${idx.vol_ratio}`);
+    const mg = d.margin || {};
+    if (mg.chg5 != null) items.push(`融资余额近5日<b>${mg.chg5 >= 0 ? '+' : ''}${mg.chg5}%</b>`);
+    if (d.winrate != null) items.push(`策略近${d.winrate_n}笔胜率${Math.round(d.winrate)}%`);
+    // 持仓数上限设置 + 强弱建议
+    const cap = d.pos_cap, sug = d.sug_cap;
+    const opts = [0, 1, 2, 3, 4].map(n =>
+      `<option value="${n}"${n === cap ? ' selected' : ''}>${n}${n === 0 ? ' (不开新仓)' : ' 仓'}</option>`).join('');
+    const sel = `<select class="poscap-sel" onchange="setPosCap(parseInt(this.value))">${opts}</select>`;
+    const sugTxt = (sug != null) ? `（强弱建议≤${sug}${cap > sug ? '，当前偏高' : ''}）` : '';
+    cont.innerHTML = `<div class="hot-title">📊 市场强弱：<span style="color:${col};font-weight:700">${d.verdict}</span> `
+      + `<span class="text-muted">${_esc(d.advice)}</span></div>`
+      + `<div class="hot-chips">${items.map(x => `<span class="hot-chip">${x}</span>`).join('')}</div>`
+      + `<div class="hot-title" style="margin-top:6px">持仓数上限 ${sel} `
+      + `<span class="text-muted">${sugTxt}</span></div>`;
+  } catch (e) { cont.innerHTML = ''; }
+}
+
+async function setPosCap(n) {
+  try {
+    await fetch('/api/settings/poscap', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pos_cap: n })
+    });
+    loadStrength();
+  } catch (e) {}
+}
+
 async function loadScan() {
+  loadStrength();
   loadHotThemes();
   const [data, wlist] = await Promise.all([
     fetch('/api/scan').then(r => r.json()),

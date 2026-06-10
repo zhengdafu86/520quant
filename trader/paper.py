@@ -321,6 +321,13 @@ class PaperAccount:
     def init_capital(self) -> float:
         return self._get("init_capital", INIT_CAPITAL)
 
+    def get_pos_cap(self, default: int = 4) -> int:
+        """持仓数上限(可配置, 0=弱市不开新仓)。仅限制开仓数量, 不改每仓大小。"""
+        return int(self._get("pos_cap", float(default)))
+
+    def set_pos_cap(self, n: int):
+        self._set("pos_cap", float(max(0, min(4, int(n)))))
+
     # ── 持仓管理 ──────────────────────────────────────
 
     def positions(self) -> dict[str, PaperPosition]:

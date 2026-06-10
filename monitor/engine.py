@@ -91,7 +91,8 @@ class MonitorEngine:
         self.interval       = interval      # 轮询间隔（秒）
         self.paper_mode     = paper_mode    # True=模拟交易 / False=实盘（需接券商）
         self.user           = user          # 该引擎服务的用户（数据隔离）
-        self.max_positions  = 4             # 最多同时持仓4只（寻优跨牛熊验证：降回撤）
+        self.max_positions  = 4             # 仓位大小基准(每仓=总资金/4)，固定不变
+        self.pos_cap        = 4             # 持仓数上限(可配置0-4)，0=弱市不开新仓；仅限数量不改仓位大小
         self.init_capital   = 200_000.0     # 总资金，用于计算每仓金额
         self.positions:  dict[str, Position]  = {}
         self.watchlist:  dict[str, WatchItem] = {}
@@ -268,6 +269,17 @@ class MonitorEngine:
                     self.load_watchlist_from_paper()   # 内部更新 _wl_sig
             except Exception as e:
                 log(f"[{self.user or '默认'}] 自选变化检测失败: {e}", "WARN")
+            # 持仓数上限实时跟随配置(Web可改, ≤1tick生效; 设0=弱市不开新仓)
+            try:
+                self.pos_cap = self._paper.get_pos_cap(self.max_positions)
+            except Exception:
+                pass
+
+        # 集合竞价(9:15-9:30)只做轻量维护(上面的自选重载)，不执行任何买卖：
+        # 连续竞价 9:30 才开始撮合，此前的报价是集合竞价指示价(可能单笔/跳空)，
+        # 据此成交不真实(曾出现"9:15 盈止损成交")。9:30后正式开盘再处理持仓/进场。
+        if not is_market_open():
+            return
 
         with self._lock:
             pos_codes   = list(self.positions.keys())
@@ -426,7 +438,7 @@ class MonitorEngine:
             ]
             log(f"候选股检查: 共{len(watch_codes_sorted)}只 | "
                 f"market_up={market_up} | hard_down={market_hard_down} | "
-                f"持仓{len(self.positions)}/{self.max_positions}", "INFO")
+                f"持仓{len(self.positions)}/{self.pos_cap}", "INFO")
             log(f"  检查顺序: {' → '.join(top_items)}", "INFO")
 
         for code in watch_codes_sorted:
@@ -453,8 +465,9 @@ class MonitorEngine:
                                               market_chg=mkt_chg)
 
             if sig.action == Action.BUY:
-                if len(self.positions) >= self.max_positions:
-                    log(f"候选 {item.name}({code}) ⛔ 已达最大持仓{self.max_positions}只，跳过")
+                if len(self.positions) >= self.pos_cap:
+                    _why = "弱市持仓上限设为0(不开新仓)" if self.pos_cap == 0 else f"已达持仓上限{self.pos_cap}只"
+                    log(f"候选 {item.name}({code}) ⛔ {_why}，跳过")
                     continue
                 price  = quote["price"]
                 shares = self._calc_shares(price, signal_type=item.signal)

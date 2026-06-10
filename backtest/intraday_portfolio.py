@@ -210,11 +210,61 @@ def _load_ctx_compute(codes):
             "day_total": day_total, "sdates": sdates, "mk": mk}
 
 
+def load_daily_cands(codes, bars=320):
+    """日线+候选(全市场) 磁盘缓存 —— 避免每次回测重复 ~14min 候选预计算。
+    缓存键=最新交易日+bars+股数(新交易日数据到来自动失效)。返回 (daily_map, cand_map, mk)。
+    候选不含防御过滤(调用方按需 {} if SM in DEF)，保持通用。"""
+    mk = db.get_market(bars=bars).copy()
+    mk["d"] = mk["datetime"].astype(str).str[:10]
+    cache_dir = os.path.expanduser("~/.520quant/bt_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    last = str(mk["d"].iloc[-1]) if len(mk) else "na"
+    path = os.path.join(cache_dir, f"dc_{last}_{bars}_{len(codes)}.pkl")
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            daily_map, cand_map = pickle.load(f)
+        return daily_map, cand_map, mk
+    daily_map, cand_map = {}, {}
+    for c in codes:
+        d = db.get(c, freq="day", bars=bars)
+        if d is None or d.empty:
+            continue
+        d = d.copy(); d["d"] = d["datetime"].astype(str).str[:10]
+        daily_map[c] = d
+        cand_map[c] = _precompute_candidates(d)
+    ok_rate = len(daily_map) / max(1, len(codes))
+    if ok_rate >= 0.97:
+        with open(path, "wb") as f:
+            pickle.dump((daily_map, cand_map), f)
+    else:   # 数据源抖动导致大量取空 → 不冻结残缺宇宙, 下次重试
+        print(f"[缓存跳过] 仅{len(daily_map)}/{len(codes)}只({ok_rate:.0%}<97%),疑mootdx抖动,不缓存")
+    return daily_map, cand_map, mk
+
+
+def load_5m_window(codes, start, end):
+    """只载入 [start,end] 区间5分钟 + 派生 day_total/sdates(省内存)。"""
+    m5_map, day_total, sdates = {}, {}, {}
+    for c in codes:
+        bars = ids.get_bars(c, "5m")
+        if not bars:
+            continue
+        m5 = {}
+        for dt, o, h, l, cl, v in bars:
+            dd = dt[:10]
+            if start <= dd <= end:
+                m5.setdefault(dd, []).append((dt, o, h, l, cl, v))
+        if m5:
+            m5_map[c] = m5
+            day_total[c] = {dt: sum(float(b[5]) for b in bs) for dt, bs in m5.items()}
+            sdates[c] = sorted(m5.keys())
+    return m5_map, day_total, sdates
+
+
 def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
              top_n=8, atr_mult=0.0, scale_pct=0.0, priority="squeeze_risk",
              tiers=None, ma5_min=10.0, stop_on_low=False, tail_entry=False,
              market_mode="ma20_ma60", macd_confirm="off", top_div="off",
-             limit_lock="off"):
+             limit_lock="off", open_buffer=0):
     """在 ctx 上跑一次忠实回测（使用 intraday 模块当前的止损/止盈参数）。
     top_n: 每日"精选"上限——只在评分最高的 top_n 只信号股里建仓（0=不设上限）。
     返回 (trades, equity_curve, positions)。"""
@@ -325,11 +375,31 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
                 return rising
             if market_mode == "either":               # 金叉 或 斜率转正(更快回场)
                 return cross or rising
+            if market_mode == "cross_slope":          # 金叉 且 MA20斜率≥0(大盘走平/回落即暂停新建仓)
+                return cross and slope >= 0
             if market_mode == "always":               # 无大盘过滤(参照)
                 return True
             return cross
         except Exception:
             return True
+
+    def market_cap(date_t):
+        """建仓容量系数: 1.0满仓 / 0.5半仓 / 0.0空仓。
+        tiered_half: 金叉→满仓; 金叉未到但MA20斜率转正(回升初期,Q4场景)→半仓博反弹;
+                     斜率向下(真下跌,如崩盘)→空仓(护盾不变)。其余模式: market_up布尔→1/0。"""
+        if market_mode != "tiered_half":
+            return 1.0 if market_up(date_t) else 0.0
+        sub = mk[mk["d"] < date_t]
+        if sub.empty:
+            return 1.0
+        last = sub.iloc[-1]
+        try:
+            cross = float(last["ma20"]) > float(last["ma60"])
+            if cross:
+                return 1.0
+            return 0.5 if float(last.get("ma20_slope", 0)) > 0 else 0.0
+        except Exception:
+            return 1.0
 
     def daily_asof(code, date_t):
         d = daily_map[code]
@@ -361,7 +431,9 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
     equity_curve = []
 
     for T in sim_dates:
-        mkt_ok = market_up(T)
+        cap = market_cap(T)
+        mkt_ok = cap > 0
+        eff_max = max(1, int(round(max_pos * cap))) if cap > 0 else 0
         # 当日候选（粘合优先，再评分降序——评分用 analyze 复算一次）
         todays = []
         _src = cand_tail if tail_entry else cand_map
@@ -443,7 +515,7 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
                                    "buy": pos["cost"], "sell": exec_p,
                                    "pnl": round(net - cost_amt, 2),
                                    "pnl_pct": round((net - cost_amt) / cost_amt * 100, 2),
-                                   "sig": pos["sig"], "exit": exit_name})
+                                   "sig": pos["sig"], "exit": exit_name, "bar": i})
 
                 # 盘中最低价口径：本根高点棘轮抬止损，低点触及即按止损价成交
                 # （贴近实盘10秒轮询的瞬时触发，能捕捉"涨5%后回踩到成本被震出"）
@@ -485,6 +557,9 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
                     # ATR 模式下止损由吊灯接管，只采纳 check_position 的止盈
                     take = (sig.action == Action.SELL_PROFIT) if atr_mult > 0 \
                            else (sig.action in (Action.SELL_STOP, Action.SELL_PROFIT))
+                    # 开盘缓冲: 前 open_buffer 根5分钟不执行止损(让开盘跳空企稳)，止盈不受限
+                    if open_buffer > 0 and i < open_buffer and sig.action == Action.SELL_STOP:
+                        take = False
                     if take:
                         is_limit = "涨停" in (getattr(sig, "reason", "") or "")
                         if is_limit and limit_lock == "disable":
@@ -503,7 +578,7 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
             # ── 进场 ──（尾盘模式跳过盘中进场，改在日终统一尾盘买）
             if mkt_ok and not tail_entry:
                 for code, stype, asof, _score in todays:
-                    if code in positions or len(positions) >= max_pos:
+                    if code in positions or len(positions) >= eff_max:
                         continue
                     day = m5_map[code].get(T)
                     if not day or i >= len(day):
@@ -544,7 +619,7 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
         # （避开次日跳空买不进；信号已在收盘成立，直接按收盘价建仓）
         if tail_entry and mkt_ok:
             for code, stype, asof, _score in todays:
-                if code in positions or len(positions) >= max_pos:
+                if code in positions or len(positions) >= eff_max:
                     continue
                 day = m5_map[code].get(T)
                 if not day:
