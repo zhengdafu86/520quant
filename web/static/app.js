@@ -733,6 +733,16 @@ async function loadStrength() {
       + `<div class="hot-chips">${items.map(x => `<span class="hot-chip">${x}</span>`).join('')}</div>`
       + `<div class="hot-title" style="margin-top:6px">持仓数上限 ${sel} `
       + `<span class="text-muted">${sugTxt}</span></div>`;
+    // V反弹确认进度条
+    const v = d.vreb;
+    if (v && v.checks) {
+      const vcol = v.n >= 4 ? '#16a34a' : (v.n >= 2 ? '#f59e0b' : '#9ca3af');
+      const chips = v.checks.map(c =>
+        `<span class="vchk${c.ok ? ' on' : ''}">${c.ok ? '✅' : '⬜'}${c.k}</span>`).join('');
+      cont.innerHTML += `<div class="hot-title" style="margin-top:6px">📈 V反弹确认 `
+        + `<span style="color:${vcol};font-weight:700">${v.n}/${v.total} · ${v.stage}</span></div>`
+        + `<div class="hot-chips">${chips}</div>`;
+    }
   } catch (e) { cont.innerHTML = ''; }
 }
 

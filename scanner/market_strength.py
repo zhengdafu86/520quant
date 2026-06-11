@@ -24,12 +24,17 @@ def _index_state() -> dict:
     close = float(last["close"]); ma20 = float(last["ma20"]); ma60 = float(last["ma60"])
     slope = float(last.get("ma20_slope", 0))
     c = mk["close"].astype(float)
+    ma5 = float(c.tail(5).mean()); ma10 = float(c.tail(10).mean())
     ret10 = (float(c.iloc[-1]) / float(c.iloc[-11]) - 1) * 100 if len(c) > 11 else 0.0
     vr = float(last.get("vol_ratio", 1.0) or 1.0)
-    return {"close": round(close, 3), "ma20": round(ma20, 3), "ma60": round(ma60, 3),
+    up_day = float(c.iloc[-1]) > float(c.iloc[-2]) if len(c) > 1 else False
+    return {"close": round(close, 3), "ma5": round(ma5, 3), "ma10": round(ma10, 3),
+            "ma20": round(ma20, 3), "ma60": round(ma60, 3),
             "cross": ma20 > ma60, "slope": round(slope, 4),
             "slope_dir": "上行" if slope > 0.001 else ("下行" if slope < -0.001 else "走平"),
-            "ret10": round(ret10, 1), "vol_ratio": round(vr, 2)}
+            "ret10": round(ret10, 1), "vol_ratio": round(vr, 2),
+            "above_ma5": close > ma5, "above_ma10": close > ma10, "above_ma20": close > ma20,
+            "up_day": bool(up_day)}
 
 
 def _breadth() -> dict:
@@ -67,6 +72,22 @@ def _margin() -> dict:
     except Exception as e:
         return {"err": str(e)[:40]}
     return {}
+
+
+def _v_progress(idx: dict, br: dict) -> dict:
+    """V反弹确认进度条 — 机器可算的5项右侧确认信号。"""
+    ratio = br.get("ratio", 0) if "err" not in br else 0
+    checks = [
+        ("涨跌家数转正", bool(ratio >= 1.0)),
+        ("放量上涨", bool(idx.get("up_day") and idx.get("vol_ratio", 0) >= 1.0)),
+        ("站上MA5", bool(idx.get("above_ma5"))),
+        ("站上MA10", bool(idx.get("above_ma10"))),
+        ("站上MA20", bool(idx.get("above_ma20"))),
+    ]
+    n = sum(1 for _, ok in checks if ok)
+    stage = "确认(可恢复进攻)" if n >= 4 else ("试探(小仓/最强龙头)" if n >= 2 else "观察(未启动)")
+    return {"n": n, "total": len(checks), "stage": stage,
+            "checks": [{"k": k, "ok": ok} for k, ok in checks]}
 
 
 def compute(recent_winrate: float = None, recent_n: int = 0) -> dict:
@@ -117,7 +138,7 @@ def compute(recent_winrate: float = None, recent_n: int = 0) -> dict:
               "弱": "降低仓位/持币观望、只打最强信号"}[verdict]
     sug_cap = {"强": 4, "中性": 4, "弱": 1}[verdict]   # 建议持仓数上限(弱市留1,极弱可手动设0)
     return {"index": idx, "breadth": br, "margin": mg, "score": score, "verdict": verdict,
-            "advice": advice, "sug_cap": sug_cap, "notes": notes,
+            "advice": advice, "sug_cap": sug_cap, "notes": notes, "vreb": _v_progress(idx, br),
             "winrate": recent_winrate, "winrate_n": recent_n}
 
 

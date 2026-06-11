@@ -264,7 +264,8 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
              top_n=8, atr_mult=0.0, scale_pct=0.0, priority="squeeze_risk",
              tiers=None, ma5_min=10.0, stop_on_low=False, tail_entry=False,
              market_mode="ma20_ma60", macd_confirm="off", top_div="off",
-             limit_lock="off", open_buffer=0):
+             limit_lock="off", open_buffer=0, cap_map=None,
+             rs_override=0.0, rs_weak_cap=2):
     """在 ctx 上跑一次忠实回测（使用 intraday 模块当前的止损/止盈参数）。
     top_n: 每日"精选"上限——只在评分最高的 top_n 只信号股里建仓（0=不设上限）。
     返回 (trades, equity_curve, positions)。"""
@@ -434,6 +435,18 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
         cap = market_cap(T)
         mkt_ok = cap > 0
         eff_max = max(1, int(round(max_pos * cap))) if cap > 0 else 0
+        # cap_map: 按日期指定持仓数上限(强弱自动减仓回测用)，覆盖 market_mode
+        if cap_map is not None:
+            eff_max = int(cap_map.get(T, max_pos))
+            mkt_ok = eff_max > 0
+        # RS-override: 大盘金叉→正常满仓; 大盘弱→不空仓而是降仓(rs_weak_cap)+只放行RS≥阈值的强势股
+        _rs_weak = False
+        if rs_override > 0:
+            _sub = mk[mk["d"] < T]
+            _cross = bool(float(_sub.iloc[-1]["ma20"]) > float(_sub.iloc[-1]["ma60"])) if len(_sub) else True
+            mkt_ok = True
+            eff_max = max_pos if _cross else rs_weak_cap
+            _rs_weak = not _cross
         # 当日候选（粘合优先，再评分降序——评分用 analyze 复算一次）
         todays = []
         _src = cand_tail if tail_entry else cand_map
@@ -445,6 +458,9 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
         # 方案A: MACD柱动能确认作为进场前置条件（off=不启用，与现行等价）
         if macd_confirm != "off":
             todays = [t for t in todays if _macd_ok(t[0], t[2], macd_confirm)]
+        # RS-override 弱市段: 只放行 RS(个股20日 − 沪深300) ≥ 阈值的强势龙头
+        if _rs_weak:
+            todays = [t for t in todays if _rs(t[0], t[2]) >= rs_override]
         # A: 精选 Top-N —— 按评分降序只保留前 top_n 只（复刻实盘"只买精选"）
         if top_n and top_n > 0 and len(todays) > top_n:
             todays.sort(key=lambda it: -it[3])

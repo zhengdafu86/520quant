@@ -166,6 +166,12 @@
 }
 .hot-chip b { font-size: 11px; background: #e65100; color: #fff;
   border-radius: 8px; padding: 0 5px; }
+.vchk {
+  display: inline-flex; align-items: center; font-size: 11px;
+  padding: 2px 7px; border-radius: 10px; background: #f3f4f6; color: #888;
+  border: 1px solid #e5e7eb;
+}
+.vchk.on { background: #ecfdf5; color: #16a34a; border-color: #a7f3d0; }
 .poscap-sel {
   font-size: 12px; padding: 2px 8px; margin: 0 4px; border-radius: 6px;
   background: #fff; color: #1976d2; border: 1px solid #90caf9;
