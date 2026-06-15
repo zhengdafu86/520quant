@@ -410,6 +410,17 @@ class MonitorEngine:
         except Exception as _e:
             log(f"大盘数据获取失败，默认允许建仓: {_e}", "WARN")
 
+        # N5见顶早警：大盘连续5日收盘<MA20 → 停新建仓（比金叉关得早，防"慢见顶"如2024-06）
+        # 回测: 2024 -18.2%→-10.3%/回撤26→18.6%, 2025-26不伤(卡玛8.27→8.70); 邻域N5/6/7稳健
+        if market_up:
+            try:
+                _tw = market_df.tail(5)
+                if len(_tw) == 5 and (_tw["close"].astype(float) < _tw["ma20"].astype(float)).all():
+                    market_up = False
+                    log("⚠️ 大盘连续5日收盘<MA20（见顶早警），今日暂停新建仓", "INFO")
+            except Exception:
+                pass
+
         # 购买优先级：① 手动优先级 P1/P2/P3 最优先（你指定的先占坑；未标的排最后）
         #             ② 其次粘合发散优先（突破蓄势，信号最强）
         #             ③ 再按【盈亏比】：到止损距离越小=止损越紧=风险越低，优先买

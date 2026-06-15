@@ -166,6 +166,11 @@
 }
 .hot-chip b { font-size: 11px; background: #e65100; color: #fff;
   border-radius: 8px; padding: 0 5px; }
+.bullv-warn {
+  background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca;
+  border-radius: 8px; padding: 6px 10px; margin-bottom: 6px;
+  font-size: 13px; font-weight: 700;
+}
 .vchk {
   display: inline-flex; align-items: center; font-size: 11px;
   padding: 2px 7px; border-radius: 10px; background: #f3f4f6; color: #888;

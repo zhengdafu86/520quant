@@ -265,7 +265,9 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
              tiers=None, ma5_min=10.0, stop_on_low=False, tail_entry=False,
              market_mode="ma20_ma60", macd_confirm="off", top_div="off",
              limit_lock="off", open_buffer=0, cap_map=None,
-             rs_override=0.0, rs_weak_cap=2):
+             rs_override=0.0, rs_weak_cap=2, breadth_map=None, breadth_thresh=1.0,
+             topwarn_days=0, topwarn_vol=False, er_min=0.0, cross_max=0,
+             reentry_cd=0):
     """在 ctx 上跑一次忠实回测（使用 intraday 模块当前的止损/止盈参数）。
     top_n: 每日"精选"上限——只在评分最高的 top_n 只信号股里建仓（0=不设上限）。
     返回 (trades, equity_curve, positions)。"""
@@ -327,6 +329,26 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
             return bool(up and (pd.isna(m[j - 2]) or m[j - 1] <= m[j - 2]))
         return bool(up)   # 'up'
 
+    def _er(code, asof, N=20):
+        """效率系数: |N日净涨幅|/Σ|每日涨跌|。→1干净趋势, →0震荡。数据不足返回1(放行)。"""
+        d = daily_map[code]; j = asof - 1
+        if j < N:
+            return 1.0
+        cl = d["close"].astype(float).values
+        net = abs(cl[j] - cl[j - N])
+        path = sum(abs(cl[k] - cl[k - 1]) for k in range(j - N + 1, j + 1))
+        return net / path if path > 0 else 1.0
+
+    def _ma20_cross(code, asof, N=20):
+        """近N日收盘穿越MA20的次数。多=震荡。数据不足返回0(放行)。"""
+        d = daily_map[code]; j = asof - 1
+        if j < N or "ma20" not in d.columns:
+            return 0
+        cl = d["close"].astype(float).values
+        ma = d["ma20"].astype(float).values
+        sign = [1 if cl[k] >= ma[k] else -1 for k in range(j - N + 1, j + 1) if not pd.isna(ma[k])]
+        return sum(1 for a, b in zip(sign, sign[1:]) if a != b)
+
     def _top_div(sub, N=20):
         """MACD顶背离（用截至T-1的日线sub）：价格较"前期DIF高点日"创了更高高点，
         但当前DIF反而更低，且仍在零轴上方(高位)。捕捉均线看不到的价/动能背离。"""
@@ -378,6 +400,12 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
                 return cross or rising
             if market_mode == "cross_slope":          # 金叉 且 MA20斜率≥0(大盘走平/回落即暂停新建仓)
                 return cross and slope >= 0
+            if market_mode == "breadth":              # 宇宙涨跌比(已滞后到T-1)≥阈值才建仓
+                return True if breadth_map is None else (breadth_map.get(date_t, breadth_thresh) >= breadth_thresh)
+            if market_mode == "cross_or_breadth":     # 金叉 或 宽度转强(更快回场, 治Q4踏空)
+                if breadth_map is not None and breadth_map.get(date_t, 0) >= breadth_thresh:
+                    return True
+                return cross
             if market_mode == "always":               # 无大盘过滤(参照)
                 return True
             return cross
@@ -430,6 +458,7 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
     positions: dict[str, dict] = {}
     trades = []
     equity_curve = []
+    _stop_cd = {}   # 再入冷却: code -> 最近一次止损出场的交易日序号
 
     for T in sim_dates:
         cap = market_cap(T)
@@ -447,6 +476,17 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
             mkt_ok = True
             eff_max = max_pos if _cross else rs_weak_cap
             _rs_weak = not _cross
+        # 见顶防御早警: 大盘连续 topwarn_days 日收盘<MA20(可选+缩量) → 强制停新建仓(比金叉关得早)
+        if topwarn_days > 0:
+            sub = mk[mk["d"] < T].tail(topwarn_days)
+            if len(sub) == topwarn_days:
+                below = (sub["close"].astype(float) < sub["ma20"].astype(float)).all()
+                shrink = True
+                if topwarn_vol and "vol" in sub.columns:
+                    v = sub["vol"].astype(float)
+                    shrink = bool(v.iloc[-1] < v.mean())   # 末日量低于本段均量=缩量
+                if below and shrink:
+                    mkt_ok = False; eff_max = 0
         # 当日候选（粘合优先，再评分降序——评分用 analyze 复算一次）
         todays = []
         _src = cand_tail if tail_entry else cand_map
@@ -461,6 +501,11 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
         # RS-override 弱市段: 只放行 RS(个股20日 − 沪深300) ≥ 阈值的强势龙头
         if _rs_weak:
             todays = [t for t in todays if _rs(t[0], t[2]) >= rs_override]
+        # 趋势质量闸: 过滤震荡股(效率系数太低/MA20穿越太多)，防whipsaw
+        if er_min > 0:
+            todays = [t for t in todays if _er(t[0], t[2]) >= er_min]
+        if cross_max > 0:
+            todays = [t for t in todays if _ma20_cross(t[0], t[2]) <= cross_max]
         # A: 精选 Top-N —— 按评分降序只保留前 top_n 只（复刻实盘"只买精选"）
         if top_n and top_n > 0 and len(todays) > top_n:
             todays.sort(key=lambda it: -it[3])
@@ -532,6 +577,8 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
                                    "pnl": round(net - cost_amt, 2),
                                    "pnl_pct": round((net - cost_amt) / cost_amt * 100, 2),
                                    "sig": pos["sig"], "exit": exit_name, "bar": i})
+                    if "STOP" in exit_name:   # 止损出场 → 记录冷却起点
+                        _stop_cd[code] = date_idx.get(T, 0)
 
                 # 盘中最低价口径：本根高点棘轮抬止损，低点触及即按止损价成交
                 # （贴近实盘10秒轮询的瞬时触发，能捕捉"涨5%后回踩到成本被震出"）
@@ -596,6 +643,8 @@ def simulate(ctx, names, start, end, max_pos=6, capital=200_000, slippage=0.0,
                 for code, stype, asof, _score in todays:
                     if code in positions or len(positions) >= eff_max:
                         continue
+                    if reentry_cd > 0 and code in _stop_cd and date_idx.get(T, 0) - _stop_cd[code] < reentry_cd:
+                        continue   # 再入冷却: 止损后N日内不回购同股
                     day = m5_map[code].get(T)
                     if not day or i >= len(day):
                         continue

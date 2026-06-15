@@ -716,7 +716,7 @@ async function loadStrength() {
     const col = d.verdict === '强' ? '#16a34a' : (d.verdict === '弱' ? '#dc2626' : '#6b7280');
     const idx = d.index || {}, br = d.breadth || {};
     const items = [];
-    if (br.up != null) items.push(`涨跌家数 <b>${br.up}:${br.down}</b>(比${br.ratio})`);
+    if (br.up != null) items.push(`涨跌家数${br.src ? '(' + br.src + ')' : ''} <b>${br.up}:${br.down}</b> 比${br.ratio}`);
     if (idx.close != null) items.push(`沪深300 ${idx.cross ? '金叉' : '破位'}·MA20${idx.slope_dir}·近10日${idx.ret10 >= 0 ? '+' : ''}${idx.ret10}%`);
     if (idx.vol_ratio != null) items.push(`量能${idx.vol_ratio}`);
     const mg = d.margin || {};
@@ -728,7 +728,12 @@ async function loadStrength() {
       `<option value="${n}"${n === cap ? ' selected' : ''}>${n}${n === 0 ? ' (不开新仓)' : ' 仓'}</option>`).join('');
     const sel = `<select class="poscap-sel" onchange="setPosCap(parseInt(this.value))">${opts}</select>`;
     const sugTxt = (sug != null) ? `（强弱建议≤${sug}${cap > sug ? '，当前偏高' : ''}）` : '';
-    cont.innerHTML = `<div class="hot-title">📊 市场强弱：<span style="color:${col};font-weight:700">${d.verdict}</span> `
+    const bv = d.bullv;
+    const bvBanner = (bv && bv.active)
+      ? `<div class="bullv-warn">⚡ 疑似暴力V (${bv.n}/4)！速查【重磅催化+涨停潮】，确认则手动激进(提持仓上限/抢龙头不等回踩)</div>`
+      : '';
+    cont.innerHTML = bvBanner
+      + `<div class="hot-title">📊 市场强弱：<span style="color:${col};font-weight:700">${d.verdict}</span> `
       + `<span class="text-muted">${_esc(d.advice)}</span></div>`
       + `<div class="hot-chips">${items.map(x => `<span class="hot-chip">${x}</span>`).join('')}</div>`
       + `<div class="hot-title" style="margin-top:6px">持仓数上限 ${sel} `
@@ -758,7 +763,6 @@ async function setPosCap(n) {
 
 async function loadScan() {
   loadStrength();
-  loadHotThemes();
   const [data, wlist] = await Promise.all([
     fetch('/api/scan').then(r => r.json()),
     fetch('/api/watchlist').then(r => r.json()),
